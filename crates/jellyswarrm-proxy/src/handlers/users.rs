@@ -137,8 +137,6 @@ pub async fn handle_authenticate_by_name(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let is_existing_user = existing_user.is_some();
-
     if let Some(user) = existing_user {
         let server_mappings = state
             .user_authorization
@@ -177,35 +175,42 @@ pub async fn handle_authenticate_by_name(
         }
     }
 
-    if is_existing_user {
-        if !servers.is_empty() {
-            info!(
-                "Skipping {} unmapped servers for existing user '{}' during login",
-                servers.len(),
-                payload.username
-            );
-        }
-    } else {
-        // For first-time users we still probe all configured servers so mappings can be created.
-        let mut leftover_tasks: Vec<_> = servers
-            .into_iter()
-            .map(|server| {
-                let state = state.clone();
-                let authentication = authentication.clone();
-                let payload = payload.clone();
-                info!(
-                    "No server mapping found for user '{}' on server '{}'",
-                    payload.username, server.name
-                );
-
-                tokio::spawn(async move {
-                    authenticate_on_server(state, authentication, payload, server, None).await
-                })
-            })
-            .collect();
-
-        auth_tasks.append(&mut leftover_tasks);
+    // Whatever's left in `servers` has no mapping for this user yet -- probe
+    // it with the freshly-submitted credentials regardless of whether the
+    // user is brand new or already has mappings elsewhere. Without this, a
+    // user whose first-ever login only matched a subset of servers (e.g.
+    // different/nonexistent credentials on another server at the time) would
+    // never automatically pick up that server later, even after it becomes
+    // reachable with the same password -- the only way in would have been an
+    // admin manually adding a mapping. `add_server_mapping` is an upsert
+    // keyed on (user_id, server_id), so re-probing an already-mapped server
+    // here would be harmless too, but there's nothing left to probe for
+    // those since the loop above already removed them from `servers`.
+    if !servers.is_empty() {
+        info!(
+            "Probing {} unmapped server(s) for user '{}'",
+            servers.len(),
+            payload.username
+        );
     }
+    let mut leftover_tasks: Vec<_> = servers
+        .into_iter()
+        .map(|server| {
+            let state = state.clone();
+            let authentication = authentication.clone();
+            let payload = payload.clone();
+            info!(
+                "No server mapping found for user '{}' on server '{}'",
+                payload.username, server.name
+            );
+
+            tokio::spawn(async move {
+                authenticate_on_server(state, authentication, payload, server, None).await
+            })
+        })
+        .collect();
+
+    auth_tasks.append(&mut leftover_tasks);
 
     // Wait for all authentication attempts to complete
     let mut successful_auths: Vec<SuccessfulServerAuth> = Vec::new();
@@ -503,4 +508,229 @@ struct SuccessfulServerAuth {
     auth_response: AuthenticateResponse,
     final_username: String,
     final_password: crate::encryption::Password,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::{AppConfig, MediaStreamingMode, MIGRATOR},
+        console_admin_service::ConsoleAdminService,
+        media_storage_service::MediaStorageService,
+        models::{SessionInfo, SyncPlayUserAccessType, User, UserPolicy},
+        server_storage::ServerStorageService,
+        session_storage::SessionStorage,
+        user_authorization_service::UserAuthorizationService,
+        DataContext, ProxyProcessors,
+    };
+    use hyper::http::HeaderValue;
+    use sqlx::SqlitePool;
+    use std::{collections::HashMap, sync::Arc};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    async fn create_test_app_state() -> AppState {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+
+        let data_context = DataContext {
+            user_authorization: Arc::new(UserAuthorizationService::new(pool.clone())),
+            server_storage: Arc::new(ServerStorageService::new(pool.clone())),
+            media_storage: Arc::new(MediaStorageService::new(pool.clone())),
+            merged_library_service: Arc::new(
+                crate::merged_library_service::MergedLibraryService::new(pool.clone()),
+            ),
+            play_sessions: Arc::new(SessionStorage::new()),
+            config: Arc::new(tokio::sync::RwLock::new(AppConfig::default())),
+        };
+
+        let processors = ProxyProcessors::new(data_context.clone());
+
+        AppState::new(
+            reqwest::Client::new(),
+            reqwest::Client::new(),
+            data_context,
+            processors,
+            crate::handlers::quick_connect::QuickConnectStorage::new(),
+            Arc::new(ConsoleAdminService::new(pool)),
+        )
+    }
+
+    fn login_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static(
+                "MediaBrowser Client=\"Jellyfin Web\", Device=\"Firefox\", DeviceId=\"test-device\", Version=\"10.10.7\"",
+            ),
+        );
+        headers
+    }
+
+    fn mock_authenticate_response(username: &str) -> AuthenticateResponse {
+        AuthenticateResponse {
+            user: User {
+                name: username.to_string(),
+                server_id: "upstream-server".to_string(),
+                id: "upstream-user-id".to_string(),
+                policy: UserPolicy {
+                    is_administrator: false,
+                    sync_play_access: SyncPlayUserAccessType::None,
+                    extra: HashMap::new(),
+                },
+                extra: HashMap::new(),
+            },
+            session_info: SessionInfo {
+                user_id: "upstream-user-id".to_string(),
+                user_name: username.to_string(),
+                server_id: "upstream-server".to_string(),
+                extra: HashMap::new(),
+            },
+            access_token: "upstream-token".to_string(),
+            server_id: "upstream-server".to_string(),
+        }
+    }
+
+    async fn mount_authenticate_success(server: &MockServer, username: &str) {
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_authenticate_response(username)),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn existing_user_picks_up_mapping_to_newly_reachable_unmapped_server() {
+        let state = create_test_app_state().await;
+
+        let mock_a = MockServer::start().await;
+        let mock_b = MockServer::start().await;
+        mount_authenticate_success(&mock_a, "Exellent").await;
+        mount_authenticate_success(&mock_b, "Exellent").await;
+
+        let server_a_id = state
+            .server_storage
+            .add_server("Server A", &mock_a.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+        let server_a = state
+            .server_storage
+            .get_server_by_id(server_a_id)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .server_storage
+            .add_server("Server B", &mock_b.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+
+        // Pre-seed: user already exists locally with exactly one mapping, to
+        // server A -- simulates their very first login only having matched
+        // one of the two configured servers.
+        let user = state
+            .user_authorization
+            .get_or_create_user("Exellent", &"correct-password".into())
+            .await
+            .unwrap();
+        let original_mapping_id = state
+            .user_authorization
+            .add_server_mapping(
+                &user.id,
+                &server_a,
+                "Exellent",
+                &"correct-password".into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Log in again -- server B is now reachable/valid with the same
+        // credentials (e.g. the account was created there since, or it was
+        // just added to federation).
+        let response = handle_authenticate_by_name(
+            State(state.clone()),
+            login_headers(),
+            Json(AuthenticateRequest {
+                username: "Exellent".to_string(),
+                password: "correct-password".into(),
+            }),
+        )
+        .await
+        .expect("login should succeed");
+        assert_eq!(response.0.user.id, user.id);
+
+        let mappings = state
+            .user_authorization
+            .list_server_mappings(&user.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            mappings.len(),
+            2,
+            "expected mappings to both servers, got {:#?}",
+            mappings
+        );
+
+        let mapping_a = mappings
+            .iter()
+            .find(|m| m.server_id == server_a.id)
+            .expect("server A mapping should still exist");
+        assert_eq!(
+            mapping_a.id, original_mapping_id,
+            "server A's existing mapping should be reused, not recreated"
+        );
+
+        assert!(
+            mappings.iter().any(|m| m.server_id != server_a.id),
+            "server B should have picked up a new mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_user_still_probes_all_servers() {
+        let state = create_test_app_state().await;
+
+        let mock_a = MockServer::start().await;
+        let mock_b = MockServer::start().await;
+        mount_authenticate_success(&mock_a, "Fresh").await;
+        mount_authenticate_success(&mock_b, "Fresh").await;
+
+        state
+            .server_storage
+            .add_server("Server A", &mock_a.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+        state
+            .server_storage
+            .add_server("Server B", &mock_b.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+
+        let response = handle_authenticate_by_name(
+            State(state.clone()),
+            login_headers(),
+            Json(AuthenticateRequest {
+                username: "Fresh".to_string(),
+                password: "some-password".into(),
+            }),
+        )
+        .await
+        .expect("login should succeed");
+
+        let mappings = state
+            .user_authorization
+            .list_server_mappings(&response.0.user.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            mappings.len(),
+            2,
+            "brand new user should map to both servers"
+        );
+    }
 }
