@@ -103,30 +103,52 @@ fn is_android_tv_client(client: &str) -> bool {
 impl Device {
     /// Check if this device matches another device based on client and either device_id or device name or version
     pub fn matches(&self, other: &Device) -> bool {
-        let self_client = normalize_device(&self.client);
-        let other_client = normalize_device(&other.client);
-
-        if self_client != other_client {
-            return false;
-        }
-
         let self_device_id = normalize_device(&self.device_id);
         let other_device_id = normalize_device(&other.device_id);
         let short_self_device_id = &self_device_id[..self_device_id.len().min(16)];
         let short_other_device_id = &other_device_id[..other_device_id.len().min(16)];
 
-        let self_has_known_device_id = Self::has_known_device_id(&self_device_id)
-            || Self::has_known_device_id(short_self_device_id);
-        let other_has_known_device_id = Self::has_known_device_id(&other_device_id)
-            || Self::has_known_device_id(short_other_device_id);
+        // Known-ness is decided on the *full* device id. Truncating first
+        // and then re-checking `has_known_device_id` on the 16-char prefix
+        // (as this used to do, via `|| has_known_device_id(short_..)`) is
+        // wrong: truncating the 18-char sentinel "unknown-device-id" to 16
+        // chars yields "unknown-device-i", which isn't in the exclusion
+        // list and so was misclassified as a *known* id -- silently
+        // defeating the "no usable device id" fallback below for exactly
+        // the placeholder `Device::from_useragent` always produces.
+        let self_has_known_device_id = Self::has_known_device_id(&self_device_id);
+        let other_has_known_device_id = Self::has_known_device_id(&other_device_id);
 
-        // 1) Strict match when both sides have a known device id.
+        // 1) Strict match when both sides have a known device id -- also
+        // require the client to match here, since we already have a strong
+        // (device id) signal and a client mismatch means these are genuinely
+        // different sessions.
         if self_has_known_device_id && other_has_known_device_id {
+            let self_client = normalize_device(&self.client);
+            let other_client = normalize_device(&other.client);
+            if self_client != other_client {
+                return false;
+            }
             return self_device_id == other_device_id
                 || short_self_device_id == short_other_device_id;
         }
 
-        // 2) Fallback to device name only when at least one side has no usable device id.
+        // 2) Fallback to device (OS) name only when at least one side has no
+        // usable device id -- and deliberately *not* on client too. This is
+        // what covers token-only follow-up requests (e.g. Jellyfin Web
+        // sending only `X-Emby-Token` right after login, with no
+        // MediaBrowser device header at all): `get_device` for that case
+        // derives a `Device` from the raw browser User-Agent string via
+        // `Device::from_useragent`, whose "client" is just a guess (e.g.
+        // "Mozilla" parsed out of "Mozilla/5.0 (...)") and will essentially
+        // never equal the real client name recorded at login (e.g. "Jellyfin
+        // Web"). Requiring client equality here would make this fallback
+        // permanently unreachable for exactly the case it exists for, so the
+        // freshly-created session for that login would never be found by
+        // the very next request the client makes -- exactly what caused a
+        // "login loop" symptom: the follow-up call would get proxied
+        // without a valid per-server token and be rejected upstream, which
+        // the client then treats as being logged out again.
         let self_device = normalize_device(&self.device);
         let other_device = normalize_device(&other.device);
         !self_device.is_empty() && self_device == other_device
@@ -1777,6 +1799,109 @@ mod tests {
             sessions5.len(),
             0,
             "Should not find any match when client and version differ"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_only_followup_request_finds_freshly_stored_session() {
+        // Regression test for a "login loop": Jellyfin Web's follow-up calls
+        // right after login (e.g. Sessions/Capabilities, DisplayPreferences)
+        // are sent with only an `X-Emby-Token` header, no MediaBrowser
+        // device info. `JellyfinAuthorization::get_device` handles that by
+        // parsing a `Device` out of the raw browser User-Agent via
+        // `Device::from_useragent`, whose "client" is only a guess (e.g.
+        // "Mozilla") and never equals the real client name stored at login
+        // (e.g. "Jellyfin Web"). Before the fix, that client mismatch made
+        // `matches()` return false unconditionally, so the just-created
+        // session was never found for these requests.
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let service = UserAuthorizationService::new(pool.clone());
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS servers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                url TEXT NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 100,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO servers (name, url, priority, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("Test Server")
+        .bind("http://localhost:8096")
+        .bind(100)
+        .bind(chrono::Utc::now())
+        .bind(chrono::Utc::now())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let user = service
+            .get_or_create_user("webuser", &"testpass".into())
+            .await
+            .unwrap();
+
+        service
+            .add_server_mapping(
+                &user.id,
+                "http://localhost:8096",
+                "mappeduser",
+                &"mappedpass".into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Login stores a session with the real Jellyfin Web client name and
+        // a proper device id.
+        let login_auth = Authorization {
+            client: "Jellyfin Web".to_string(),
+            device: "Android".to_string(),
+            device_id: "TW96aWxsYS81LjAgKExpbnV4OyBBbmRyb2lkIDEwOyBLKXwxNzgz".to_string(),
+            version: "10.11.10".to_string(),
+            token: None,
+        };
+        service
+            .store_authorization_session(
+                &user.id,
+                "http://localhost:8096",
+                &login_auth,
+                "jellyfin-token".to_string(),
+                "original-jellyfin-user-id".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The immediate follow-up request only has `X-Emby-Token`, so its
+        // Device is derived purely from the raw browser User-Agent.
+        let followup_device = crate::user_authorization_service::Device::from_useragent(
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
+        );
+        assert_eq!(followup_device.client, "Mozilla");
+        assert_eq!(followup_device.device, "Android");
+
+        let sessions = service
+            .get_user_sessions(&user.id, Some(followup_device))
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "token-only follow-up request should still find the session just stored at login"
         );
     }
 
