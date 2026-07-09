@@ -19,8 +19,11 @@ RUN --mount=type=cache,target=/root/.npm \
 COPY ui/ ./
 COPY .git/modules/ui/ /app/.git/modules/ui/
 
-# Get and print UI version info
-RUN UI_VERSION=$(git describe --tags --abbrev=0) && \
+# Get and print UI version info. `git describe --tags` needs tag history,
+# which isn't necessarily present for a submodule checked out via a shallow
+# clone (e.g. Docker's remote git build context) -- fall back to "unknown"
+# rather than failing the build over version-string cosmetics.
+RUN UI_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "unknown") && \
     UI_COMMIT=$(git rev-parse HEAD) && \
     echo "UI_VERSION=${UI_VERSION#v}" && \
     echo "UI_COMMIT=$UI_COMMIT"
@@ -29,7 +32,7 @@ RUN UI_VERSION=$(git describe --tags --abbrev=0) && \
 RUN npm run build:production
 
 # Write ui-version.env file
-RUN UI_VERSION=$(git describe --tags --abbrev=0) && \
+RUN UI_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "unknown") && \
     UI_COMMIT=$(git rev-parse HEAD) && \
     printf "UI_VERSION=%s\nUI_COMMIT=%s\n" "${UI_VERSION#v}" "$UI_COMMIT" > dist/ui-version.env && \
     echo "Generated dist/ui-version.env"
