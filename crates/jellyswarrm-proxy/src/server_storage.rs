@@ -11,6 +11,7 @@ use jellyfin_api::{
     models::PublicSystemInfo,
 };
 
+use crate::admin_id::AdminId;
 use crate::config::MediaStreamingMode;
 use crate::encryption::EncryptedPassword;
 use crate::server_id::ServerId;
@@ -25,6 +26,12 @@ pub struct Server {
     pub media_streaming_mode: MediaStreamingMode,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// The console admin who owns (may add/edit/remove) this server. `None`
+    /// for servers predating multi-admin support that were never backfilled,
+    /// or ones whose owning admin was since deleted (`ON DELETE SET NULL`).
+    /// Ownerless servers are management-plane orphans only -- they still
+    /// appear in the shared end-user library like any other server.
+    pub owner_admin_id: Option<AdminId>,
 }
 
 impl Server {
@@ -44,9 +51,17 @@ impl Server {
                 .unwrap_or(MediaStreamingMode::Redirect),
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
+            owner_admin_id: row
+                .try_get::<Option<i64>, _>("owner_admin_id")?
+                .map(AdminId::new),
         })
     }
 
+    /// Used for the authorization-session join query (media/playback
+    /// plumbing), which never selects `owner_admin_id` -- ownership is
+    /// irrelevant there, since federated/playback endpoints stay global and
+    /// unscoped by design. Always `None`; do not use this constructor path
+    /// for anything that makes an ownership decision.
     pub(crate) fn from_session_join_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
         Ok(Server {
             id: ServerId::new(row.try_get("server_id")?),
@@ -59,6 +74,7 @@ impl Server {
                 .unwrap_or(MediaStreamingMode::Redirect),
             created_at: row.try_get("server_created_at")?,
             updated_at: row.try_get("server_updated_at")?,
+            owner_admin_id: None,
         })
     }
 }
@@ -145,6 +161,22 @@ impl ServerStorageService {
         priority: i32,
         media_streaming_mode: MediaStreamingMode,
     ) -> Result<ServerId, sqlx::Error> {
+        self.add_server_with_owner(name, url, priority, media_streaming_mode, None)
+            .await
+    }
+
+    /// Same as [`add_server`](Self::add_server), but assigns the new server
+    /// to `owner_admin_id` (a console admin) at creation time. Used when a
+    /// specific admin creates the server through the UI, so it starts out
+    /// owned by them rather than ownerless.
+    pub async fn add_server_with_owner(
+        &self,
+        name: &str,
+        url: &str,
+        priority: i32,
+        media_streaming_mode: MediaStreamingMode,
+        owner_admin_id: Option<AdminId>,
+    ) -> Result<ServerId, sqlx::Error> {
         let url = match ServerUrl::parse(url) {
             Ok(url) => url,
             Err(_) => {
@@ -159,14 +191,15 @@ impl ServerStorageService {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO servers (name, url, priority, media_streaming_mode, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO servers (name, url, priority, media_streaming_mode, owner_admin_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(name)
         .bind(url.as_str())
         .bind(priority)
         .bind(media_streaming_mode.to_string())
+        .bind(owner_admin_id.map(AdminId::as_i64))
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -183,8 +216,8 @@ impl ServerStorageService {
     pub async fn get_server_by_name(&self, name: &str) -> Result<Option<Server>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, url, priority, media_streaming_mode, created_at, updated_at
-            FROM servers 
+            SELECT id, name, url, priority, media_streaming_mode, owner_admin_id, created_at, updated_at
+            FROM servers
             WHERE name = ?
             "#,
         )
@@ -198,8 +231,8 @@ impl ServerStorageService {
     pub async fn get_server_by_id(&self, id: ServerId) -> Result<Option<Server>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, url, priority, media_streaming_mode, created_at, updated_at
-            FROM servers 
+            SELECT id, name, url, priority, media_streaming_mode, owner_admin_id, created_at, updated_at
+            FROM servers
             WHERE id = ?
             "#,
         )
@@ -213,8 +246,8 @@ impl ServerStorageService {
     pub async fn list_servers(&self) -> Result<Vec<Server>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
-            SELECT id, name, url, priority, media_streaming_mode, created_at, updated_at
-            FROM servers 
+            SELECT id, name, url, priority, media_streaming_mode, owner_admin_id, created_at, updated_at
+            FROM servers
             ORDER BY priority DESC, name ASC
             "#,
         )
@@ -222,6 +255,51 @@ impl ServerStorageService {
         .await?;
 
         rows.into_iter().map(Server::from_row).collect()
+    }
+
+    /// Servers owned by a specific console admin -- used to scope the admin
+    /// UI's server list/mutations. Superadmins bypass this and use
+    /// [`list_servers`](Self::list_servers) directly to see everything.
+    pub async fn list_servers_owned_by(
+        &self,
+        admin_id: AdminId,
+    ) -> Result<Vec<Server>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name, url, priority, media_streaming_mode, owner_admin_id, created_at, updated_at
+            FROM servers
+            WHERE owner_admin_id = ?
+            ORDER BY priority DESC, name ASC
+            "#,
+        )
+        .bind(admin_id.as_i64())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(Server::from_row).collect()
+    }
+
+    /// Reassigns (or clears, with `None`) a server's owning admin.
+    pub async fn set_owner(
+        &self,
+        server_id: ServerId,
+        owner_admin_id: Option<AdminId>,
+    ) -> Result<bool, sqlx::Error> {
+        let now = chrono::Utc::now();
+        let result = sqlx::query(
+            r#"
+            UPDATE servers
+            SET owner_admin_id = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(owner_admin_id.map(AdminId::as_i64))
+        .bind(now)
+        .bind(server_id.as_i64())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn update_server_priority(
@@ -466,6 +544,20 @@ mod tests {
 
     use super::*;
 
+    /// `servers.owner_admin_id` has a foreign key into `console_admins`, so
+    /// ownership tests need a real admin row to point at, not just an
+    /// arbitrary id.
+    async fn insert_test_admin(pool: &SqlitePool, username: &str) -> AdminId {
+        let result = sqlx::query(
+            "INSERT INTO console_admins (username, password_hash, is_superadmin) VALUES (?, 'test-hash', 0)",
+        )
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+        AdminId::new(result.last_insert_rowid())
+    }
+
     #[tokio::test]
     async fn test_server_storage_service() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
@@ -523,5 +615,101 @@ mod tests {
 
         let server = service.get_server_by_id(server_id).await.unwrap().unwrap();
         assert_eq!(server.media_streaming_mode, MediaStreamingMode::Proxy);
+    }
+
+    #[tokio::test]
+    async fn ownership_is_assigned_on_add_and_scopes_list_servers_owned_by() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let admin_a = insert_test_admin(&pool, "admin-a").await;
+        let admin_b = insert_test_admin(&pool, "admin-b").await;
+        let service = ServerStorageService::new(pool);
+
+        let server_a = service
+            .add_server_with_owner(
+                "server-a",
+                "http://a.example:8096",
+                100,
+                MediaStreamingMode::Redirect,
+                Some(admin_a),
+            )
+            .await
+            .unwrap();
+        let server_b = service
+            .add_server_with_owner(
+                "server-b",
+                "http://b.example:8096",
+                100,
+                MediaStreamingMode::Redirect,
+                Some(admin_b),
+            )
+            .await
+            .unwrap();
+
+        let fetched_a = service.get_server_by_id(server_a).await.unwrap().unwrap();
+        assert_eq!(fetched_a.owner_admin_id, Some(admin_a));
+
+        let owned_by_a = service.list_servers_owned_by(admin_a).await.unwrap();
+        assert_eq!(owned_by_a.len(), 1);
+        assert_eq!(owned_by_a[0].id, server_a);
+
+        let owned_by_b = service.list_servers_owned_by(admin_b).await.unwrap();
+        assert_eq!(owned_by_b.len(), 1);
+        assert_eq!(owned_by_b[0].id, server_b);
+
+        // The shared-library invariant: list_servers (used by the
+        // federated/merged-library code path) is never filtered by
+        // ownership -- both admins' servers always appear together.
+        let all = service.list_servers().await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn set_owner_reassigns_and_clears_ownership() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let admin = insert_test_admin(&pool, "some-admin").await;
+        let service = ServerStorageService::new(pool);
+
+        let server_id = service
+            .add_server(
+                "unowned-server",
+                "http://example.test:8096",
+                100,
+                MediaStreamingMode::Redirect,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .get_server_by_id(server_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .owner_admin_id,
+            None
+        );
+
+        assert!(service.set_owner(server_id, Some(admin)).await.unwrap());
+        assert_eq!(
+            service
+                .get_server_by_id(server_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .owner_admin_id,
+            Some(admin)
+        );
+
+        assert!(service.set_owner(server_id, None).await.unwrap());
+        assert_eq!(
+            service
+                .get_server_by_id(server_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .owner_admin_id,
+            None
+        );
     }
 }

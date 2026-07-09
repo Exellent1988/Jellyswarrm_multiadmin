@@ -15,6 +15,7 @@ use crate::{
     federated_users::ServerSyncResult,
     server_id::ServerId,
     server_storage::Server,
+    ui::admin::ownership::{may_act_on, CurrentAdmin},
     user_authorization_service::{ServerMapping, User},
     AppState,
 };
@@ -353,6 +354,7 @@ pub async fn delete_user(
 /// Add mapping
 pub async fn add_mapping(
     State(state): State<AppState>,
+    admin: CurrentAdmin,
     Form(form): Form<AddMappingForm>,
 ) -> Response {
     if form.mapped_username.trim().is_empty() || form.mapped_password.as_str().is_empty() {
@@ -393,6 +395,15 @@ pub async fn add_mapping(
             .await;
         }
     };
+
+    if !may_act_on(&admin, &server) {
+        return user_item_with_popup(
+            &state,
+            &form.user_id,
+            "You don't have permission to add mappings for that server.".to_string(),
+        )
+        .await;
+    }
 
     let client = match JellyfinClient::new(server.url.as_str(), crate::config::CLIENT_INFO.clone())
     {
@@ -493,8 +504,53 @@ pub async fn add_mapping(
 /// Delete mapping
 pub async fn delete_mapping(
     State(state): State<AppState>,
+    admin: CurrentAdmin,
     Path((user_id, mapping_id)): Path<(String, i64)>,
 ) -> Response {
+    // Resolve which server this mapping belongs to first, so we can apply
+    // the same ownership rule as adding a mapping -- only the owning admin
+    // (or a superadmin) may remove it.
+    match state
+        .user_authorization
+        .get_server_mapping_by_id(mapping_id)
+        .await
+    {
+        Ok(Some(mapping)) => {
+            let server = match state
+                .server_storage
+                .get_server_by_id(mapping.server_id)
+                .await
+            {
+                Ok(Some(server)) => server,
+                Ok(None) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Html("<div class=\"alert alert-error\">Server not found</div>"),
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    error!("Failed to load server for mapping {}: {}", mapping_id, e);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+                }
+            };
+            if !may_act_on(&admin, &server) {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+        }
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Html("<div class=\"alert alert-error\">Mapping not found</div>"),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!("Failed to load mapping {}: {}", mapping_id, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+        }
+    }
+
     match state
         .user_authorization
         .delete_server_mapping(mapping_id)

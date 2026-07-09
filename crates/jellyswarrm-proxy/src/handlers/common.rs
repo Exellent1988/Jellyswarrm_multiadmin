@@ -432,6 +432,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{AppConfig, MediaStreamingMode, MIGRATOR},
+        console_admin_service::ConsoleAdminService,
         media_storage_service::MediaStorageService,
         merged_library_service::MergedLibraryService,
         server_id::ServerId,
@@ -470,6 +471,7 @@ mod tests {
             media_streaming_mode: MediaStreamingMode::Redirect,
             created_at: now,
             updated_at: now,
+            owner_admin_id: None,
         };
 
         let config = AppConfig {
@@ -481,7 +483,7 @@ mod tests {
             user_authorization: Arc::new(UserAuthorizationService::new(pool.clone())),
             server_storage: Arc::new(ServerStorageService::new(pool.clone())),
             media_storage: Arc::new(MediaStorageService::new(pool.clone())),
-            merged_library_service: Arc::new(MergedLibraryService::new(pool)),
+            merged_library_service: Arc::new(MergedLibraryService::new(pool.clone())),
             play_sessions: Arc::new(SessionStorage::new()),
             config: Arc::new(tokio::sync::RwLock::new(config)),
         };
@@ -495,6 +497,7 @@ mod tests {
                 data_context,
                 processors,
                 crate::handlers::quick_connect::QuickConnectStorage::new(),
+                Arc::new(ConsoleAdminService::new(pool)),
             ),
             server,
         )

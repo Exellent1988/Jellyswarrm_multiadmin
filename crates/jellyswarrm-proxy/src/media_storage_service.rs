@@ -344,6 +344,7 @@ mod tests {
             media_streaming_mode: MediaStreamingMode::Redirect,
             created_at: now,
             updated_at: now,
+            owner_admin_id: None,
         }
     }
 

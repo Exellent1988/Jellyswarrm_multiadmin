@@ -733,6 +733,27 @@ impl UserAuthorizationService {
         Ok(mapping)
     }
 
+    /// Get a server mapping by its own id, regardless of user -- used to
+    /// resolve which server a mapping belongs to before an ownership check
+    /// (e.g. deleting a mapping), when only the mapping id is known.
+    pub async fn get_server_mapping_by_id(
+        &self,
+        mapping_id: i64,
+    ) -> Result<Option<ServerMapping>, sqlx::Error> {
+        let mapping = sqlx::query_as::<_, ServerMapping>(
+            r#"
+            SELECT id, user_id, server_id, server_url, mapped_username, mapped_password, created_at, updated_at
+            FROM server_mappings
+            WHERE id = ?
+            "#,
+        )
+        .bind(mapping_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(mapping)
+    }
+
     /// List all server mappings for a user
     pub async fn list_server_mappings(
         &self,
@@ -1328,7 +1349,7 @@ impl UserAuthorizationService {
     pub async fn get_mapped_servers(&self, user_id: &str) -> Result<Vec<Server>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
-            SELECT s.id, s.name, s.url, s.priority, s.media_streaming_mode, s.created_at, s.updated_at
+            SELECT s.id, s.name, s.url, s.priority, s.media_streaming_mode, s.owner_admin_id, s.created_at, s.updated_at
             FROM servers s
             JOIN server_mappings sm ON s.id = sm.server_id
             WHERE sm.user_id = ?

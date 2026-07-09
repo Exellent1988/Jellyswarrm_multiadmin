@@ -1,0 +1,70 @@
+{% if admins.is_empty() %}
+    <article>
+        <header><h4>No admins configured</h4></header>
+    </article>
+{% else %}
+<table aria-label="Console admins">
+    <thead>
+        <tr>
+            <th>Username</th>
+            <th>Role</th>
+            <th style="text-align: center;">Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for admin in admins %}
+        <tr>
+            <td style="vertical-align: middle;"><strong>{{ admin.username }}</strong></td>
+            <td style="vertical-align: middle;">
+                {% if admin.is_superadmin %}
+                <span class="badge success"><i class="fas fa-user-shield" style="margin-right: 0.3rem; font-size: 0.7rem;"></i> Superadmin</span>
+                {% else %}
+                <span class="badge">Admin</span>
+                {% endif %}
+            </td>
+            <td style="text-align: center; vertical-align: middle;">
+                <div style="display: flex; justify-content: center; gap: 0.5rem;">
+                    <button type="button" class="icon-btn"
+                            onclick="document.getElementById('reset-password-modal-{{ admin.id }}').showModal()"
+                            title="Reset password">
+                        <i class="fas fa-key" aria-hidden="true"></i>
+                    </button>
+
+                    <dialog id="reset-password-modal-{{ admin.id }}">
+                        <article>
+                            <header>
+                                <button aria-label="Close" rel="prev" onclick="this.closest('dialog').close()"></button>
+                                <h3>Reset password for {{ admin.username }}</h3>
+                            </header>
+                            <div id="admin-password-error-{{ admin.id }}"></div>
+                            <form id="reset-password-form-{{ admin.id }}" hx-post="/{{ ui_route }}/admins/{{ admin.id }}/password" hx-target="#admin-password-error-{{ admin.id }}" hx-swap="innerHTML">
+                                <label>
+                                    New password
+                                    {% let pw_input_name = "password" %}
+                                    {% let pw_input_placeholder = "••••••••" %}
+                                    {% let pw_input_autocomplete = "new-password" %}
+                                    {% let pw_input_required = true %}
+                                    {% include "components/password_input.html" %}
+                                </label>
+                            </form>
+                            <footer style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                                <button type="button" class="secondary" onclick="this.closest('dialog').close()" style="margin-bottom: 0;">Cancel</button>
+                                <button type="submit" form="reset-password-form-{{ admin.id }}" style="margin-bottom: 0;">Reset</button>
+                            </footer>
+                        </article>
+                    </dialog>
+
+                    <button type="button" class="icon-btn danger"
+                            hx-delete="/{{ ui_route }}/admins/{{ admin.id }}"
+                            hx-confirm="Delete admin '{{ admin.username }}'? Their servers stay in the shared library, ownerless until reassigned."
+                            hx-target="#admin-list" hx-swap="innerHTML"
+                            title="Delete admin">
+                        <i class="fas fa-trash" aria-hidden="true"></i>
+                    </button>
+                </div>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}

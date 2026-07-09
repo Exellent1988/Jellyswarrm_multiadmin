@@ -9,6 +9,7 @@
         <tr>
             <th>Name</th>
             <th>URL</th>
+            {% if is_superadmin %}<th>Owner</th>{% endif %}
             <th>Priority</th>
             <th>Streaming</th>
             <th>Status</th>
@@ -20,6 +21,11 @@
         <tr>
             <td style="vertical-align: middle;"><strong>{{ item.server.name }}</strong></td>
             <td style="vertical-align: middle;"><a href="{{ item.server.url }}" target="_blank" rel="noopener noreferrer">{{ item.server.url }}</a></td>
+            {% if is_superadmin %}
+            <td style="vertical-align: middle;">
+                {% if let Some(owner) = item.owner_username %}{{ owner }}{% else %}<span style="color: var(--pico-muted-color);">&mdash;</span>{% endif %}
+            </td>
+            {% endif %}
             <td style="vertical-align: middle;">
           <input type="number" value="{{ item.server.priority }}" min="1" max="999"
               hx-patch="/{{ ui_route }}/servers/{{ item.server.id }}/priority"

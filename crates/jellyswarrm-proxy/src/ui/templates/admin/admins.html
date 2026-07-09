@@ -1,0 +1,37 @@
+<div id="messages"></div>
+
+<header>
+    <h1>Admin Accounts</h1>
+    <h3>Manage who can log into this console. Each admin manages their own servers; everyone still sees the same shared library.</h3>
+</header>
+
+<section id="add-admin" aria-labelledby="add-admin-heading">
+    <h2 id="add-admin-heading" class="section-heading-tight">Add Admin</h2>
+    <form hx-post="/{{ ui_route }}/admins" hx-target="#admin-list" hx-swap="innerHTML" hx-disabled-elt="this" hx-on::after-request="if(event.detail.successful) this.reset()">
+        <div class="grid" style="--pico-grid-gap:1rem; align-items:end;">
+            <label>Username
+                <input type="text" name="username" placeholder="e.g. alice" autocomplete="off" required style="margin-bottom:0;">
+            </label>
+            <label>Password
+                {% let pw_input_name = "password" %}
+                {% let pw_input_placeholder = "••••••••" %}
+                {% let pw_input_autocomplete = "new-password" %}
+                {% let pw_input_required = true %}
+                {% include "components/password_input.html" %}
+            </label>
+            <label>&nbsp;
+                <button type="submit" style="margin-bottom:0;">Add</button>
+            </label>
+        </div>
+        <label style="margin-top: 0.25rem; display:inline-flex; align-items:center; gap:0.5rem;">
+            <input type="checkbox" name="is_superadmin" value="true">
+            <span data-tooltip="Superadmins can manage every server, manage other admin accounts, and change global settings.">Superadmin</span>
+        </label>
+    </form>
+</section>
+
+<hr />
+
+<section id="admin-list" hx-get="/{{ ui_route }}/admins/list" hx-trigger="load">
+    <p>Loading admins...</p>
+</section>

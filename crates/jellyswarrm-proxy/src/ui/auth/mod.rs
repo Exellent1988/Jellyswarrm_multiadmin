@@ -6,13 +6,34 @@ use axum::{
 };
 use axum_login::{AuthUser, AuthnBackend, UserId};
 use serde::{Deserialize, Serialize};
-use tokio::{sync::RwLock, task};
+use tokio::task;
 use tracing::info;
 
 use crate::{
-    config::AppConfig, encryption::HashedPassword,
+    admin_id::AdminId, console_admin_service::ConsoleAdminService, encryption::HashedPassword,
     user_authorization_service::UserAuthorizationService,
 };
+
+/// Prefix used in `User::id` for console admin accounts, so `Backend` can
+/// tell an admin session apart from an end-user session without a separate
+/// enum variant on `UserRole` (which would ripple through every existing
+/// `role == UserRole::Admin` check). Parsed back out by `parse_console_admin_id`.
+const CONSOLE_ADMIN_ID_PREFIX: &str = "console:";
+
+/// Extracts the numeric admin id from a `User::id` produced for an admin
+/// session, or `None` if `user_id` isn't a console-admin id. Used by the
+/// `CurrentAdmin` extractor in `ui::admin::ownership` to recover *which*
+/// admin is logged in for ownership checks.
+pub fn parse_console_admin_id(user_id: &str) -> Option<AdminId> {
+    user_id
+        .strip_prefix(CONSOLE_ADMIN_ID_PREFIX)
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(AdminId::new)
+}
+
+fn console_admin_user_id(id: AdminId) -> String {
+    format!("{CONSOLE_ADMIN_ID_PREFIX}{id}")
+}
 
 mod routes;
 
@@ -91,13 +112,19 @@ pub struct Credentials {
 
 #[derive(Debug, Clone)]
 pub struct Backend {
-    config: Arc<RwLock<AppConfig>>,
     user_auth: Arc<UserAuthorizationService>,
+    console_admins: Arc<ConsoleAdminService>,
 }
 
 impl Backend {
-    pub fn new(config: Arc<RwLock<AppConfig>>, user_auth: Arc<UserAuthorizationService>) -> Self {
-        Self { config, user_auth }
+    pub fn new(
+        user_auth: Arc<UserAuthorizationService>,
+        console_admins: Arc<ConsoleAdminService>,
+    ) -> Self {
+        Self {
+            user_auth,
+            console_admins,
+        }
     }
 }
 
@@ -118,21 +145,24 @@ impl AuthnBackend for Backend {
         &self,
         creds: Self::Credentials,
     ) -> Result<Option<Self::User>, Self::Error> {
-        let password = creds.password.into();
-        let config = self.config.read().await;
         info!("Authenticating user: {}", creds.username);
-        if creds.username == config.username && password == config.password {
-            info!("Admin authentication successful");
-            // If the password is correct, we return the default user.
+
+        if let Some(admin) = self
+            .console_admins
+            .verify_credentials(&creds.username, &creds.password)
+            .await?
+        {
+            info!("Admin authentication successful: {}", admin.username);
             let user = User {
-                id: "admin".to_string(),
-                username: creds.username,
-                password_hash: config.password.clone().into(),
+                id: console_admin_user_id(admin.id),
+                username: admin.username,
+                password_hash: HashedPassword::from_hashed(admin.password_hash),
                 role: UserRole::Admin,
             };
             return Ok(Some(user));
         }
 
+        let password = creds.password.into();
         if let Some(user) = self
             .user_auth
             .get_user_by_credentials(&creds.username, &password)
@@ -153,14 +183,17 @@ impl AuthnBackend for Backend {
     }
 
     async fn get_user(&self, user_id: &UserId<Self>) -> Result<Option<Self::User>, Self::Error> {
-        if user_id == "admin" {
-            let config = self.config.read().await;
-            return Ok(Some(User {
-                id: "admin".to_string(),
-                username: config.username.clone(),
-                password_hash: config.password.clone().into(),
-                role: UserRole::Admin,
-            }));
+        if let Some(admin_id) = parse_console_admin_id(user_id) {
+            return Ok(self
+                .console_admins
+                .get_admin_by_id(admin_id)
+                .await?
+                .map(|admin| User {
+                    id: console_admin_user_id(admin.id),
+                    username: admin.username,
+                    password_hash: HashedPassword::from_hashed(admin.password_hash),
+                    role: UserRole::Admin,
+                }));
         }
 
         if let Some(user) = self.user_auth.get_user_by_id(user_id).await? {

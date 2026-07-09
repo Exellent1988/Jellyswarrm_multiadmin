@@ -683,6 +683,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{AppConfig, MediaStreamingMode, MIGRATOR},
+        console_admin_service::ConsoleAdminService,
         media_storage_service::MediaStorageService,
         models::{AuthenticateResponse, SessionInfo, SyncPlayUserAccessType, User, UserPolicy},
         server_storage::ServerStorageService,
@@ -708,7 +709,7 @@ mod tests {
             server_storage: Arc::new(ServerStorageService::new(pool.clone())),
             media_storage: Arc::new(MediaStorageService::new(pool.clone())),
             merged_library_service: Arc::new(
-                crate::merged_library_service::MergedLibraryService::new(pool),
+                crate::merged_library_service::MergedLibraryService::new(pool.clone()),
             ),
             play_sessions: Arc::new(SessionStorage::new()),
             config: Arc::new(tokio::sync::RwLock::new(AppConfig::default())),
@@ -722,6 +723,7 @@ mod tests {
             data_context,
             processors,
             QuickConnectStorage::new(),
+            Arc::new(ConsoleAdminService::new(pool)),
         )
     }
 

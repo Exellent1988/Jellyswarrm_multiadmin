@@ -21,6 +21,20 @@
         Settings
     </a>
 </li>
+{% if is_superadmin %}
+<li>
+    <a href="#" hx-get="/{{ ui_route }}/admins" hx-target="#main-content" class="nav-link">
+        <i class="fas fa-user-shield" style="margin-right: 0.25rem;"></i>
+        Admins
+    </a>
+</li>
+{% endif %}
+<li>
+    <span class="nav-link" style="color: var(--pico-muted-color);" title="Logged in as">
+        <i class="fas fa-user" style="margin-right: 0.25rem;"></i>
+        {{ username }}
+    </span>
+</li>
 
 {% endblock %}
 

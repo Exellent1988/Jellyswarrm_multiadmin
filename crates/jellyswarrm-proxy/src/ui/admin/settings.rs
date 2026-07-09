@@ -8,7 +8,7 @@ use axum::{
 use serde::Deserialize;
 use tracing::error;
 
-use crate::{config::save_config, AppState};
+use crate::{config::save_config, ui::admin::ownership::SuperAdmin, AppState};
 
 #[derive(Template)]
 #[template(path = "admin/settings.html")]
@@ -28,7 +28,7 @@ pub struct SettingsFormTemplate {
     pub ui_route: String,
 }
 
-pub async fn settings_page(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn settings_page(State(state): State<AppState>, _admin: SuperAdmin) -> impl IntoResponse {
     let template = SettingsPageTemplate {
         ui_route: state.get_ui_route().await,
     };
@@ -41,7 +41,7 @@ pub async fn settings_page(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-pub async fn settings_form(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn settings_form(State(state): State<AppState>, _admin: SuperAdmin) -> impl IntoResponse {
     let cfg = state.config.read().await.clone();
     let form = SettingsFormTemplate {
         server_id: cfg.server_id,
@@ -76,6 +76,7 @@ pub struct SaveForm {
 
 pub async fn save_settings(
     State(state): State<AppState>,
+    admin: SuperAdmin,
     Form(form): Form<SaveForm>,
 ) -> impl IntoResponse {
     if form.public_address.trim().is_empty() || form.server_name.trim().is_empty() {
@@ -97,10 +98,10 @@ pub async fn save_settings(
         }
     }
     // Return fresh form (like server list pattern)
-    settings_form(State(state)).await.into_response()
+    settings_form(State(state), admin).await.into_response()
 }
 
-pub async fn reload_config(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn reload_config(State(state): State<AppState>, _admin: SuperAdmin) -> impl IntoResponse {
     let new_cfg = crate::config::load_config();
     {
         let mut cfg = state.config.write().await;

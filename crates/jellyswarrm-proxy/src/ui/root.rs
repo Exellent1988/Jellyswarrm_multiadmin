@@ -8,7 +8,7 @@ use tracing::{error, info};
 
 use crate::{
     ui::{
-        auth::{AuthenticatedUser, UserRole},
+        auth::{parse_console_admin_id, AuthenticatedUser, UserRole},
         JellyfinUiVersion, JELLYFIN_UI_VERSION,
     },
     AppState,
@@ -30,6 +30,8 @@ pub struct AdminIndexTemplate {
     pub ui_route: String,
     pub root: Option<String>,
     pub jellyfin_ui_version: Option<JellyfinUiVersion>,
+    pub username: String,
+    pub is_superadmin: bool,
 }
 
 /// Root/home page
@@ -54,11 +56,24 @@ pub async fn index(
         }
     } else {
         info!("Rendering admin dashboard for {}", user.username);
+        let is_superadmin = match parse_console_admin_id(&user.id) {
+            Some(admin_id) => state
+                .console_admins
+                .get_admin_by_id(admin_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|admin| admin.is_superadmin)
+                .unwrap_or(false),
+            None => false,
+        };
         let template = AdminIndexTemplate {
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
             ui_route: state.get_ui_route().await,
             root: state.get_url_prefix().await,
             jellyfin_ui_version: JELLYFIN_UI_VERSION.clone(),
+            username: user.username,
+            is_superadmin,
         };
 
         match template.render() {

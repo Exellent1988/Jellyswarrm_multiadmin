@@ -26,7 +26,9 @@ use axum_login::{
     AuthManagerLayerBuilder,
 };
 
+mod admin_id;
 mod config;
+mod console_admin_service;
 mod encryption;
 mod extractors;
 mod federated_users;
@@ -46,6 +48,7 @@ mod ui;
 mod url_helper;
 mod user_authorization_service;
 
+use console_admin_service::ConsoleAdminService;
 use federated_users::FederatedUserService;
 use handlers::syncplay::SyncPlayService;
 use legacy_server_identity::canonicalize_legacy_server_identity;
@@ -93,6 +96,7 @@ pub struct AppState {
     pub quick_connect: QuickConnectStorage,
     pub federated_users: Arc<FederatedUserService>,
     pub syncplay: Arc<SyncPlayService>,
+    pub console_admins: Arc<ConsoleAdminService>,
 }
 
 impl AppState {
@@ -102,6 +106,7 @@ impl AppState {
         data_context: DataContext,
         proxy_processors: ProxyProcessors,
         quick_connect: QuickConnectStorage,
+        console_admins: Arc<ConsoleAdminService>,
     ) -> Self {
         // Create temporary state to initialize FederatedUserService
         // This is a bit circular but FederatedUserService needs parts of AppState
@@ -124,6 +129,7 @@ impl AppState {
             processors: Arc::new(proxy_processors),
             quick_connect,
             federated_users,
+            console_admins,
             syncplay: Arc::new(SyncPlayService::new()),
         }
     }
@@ -338,6 +344,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     });
 
+    // Initialize console admin service and fill in the migration's sentinel
+    // bootstrap admin from JELLYSWARRM_USERNAME/PASSWORD the first time it's
+    // found (no-op on every later restart once a real admin exists).
+    let console_admins = Arc::new(ConsoleAdminService::new(pool.clone()));
+    console_admins
+        .ensure_bootstrap_admin(&loaded_config)
+        .await
+        .unwrap_or_else(|e| {
+            error!("Failed to bootstrap initial console admin: {}", e);
+            std::process::exit(1);
+        });
+
     // Create reqwest client for regular API traffic.
     let reqwest_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(loaded_config.timeout))
@@ -441,6 +459,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         data_context,
         proxy_processors,
         quick_connect::QuickConnectStorage::new(),
+        console_admins.clone(),
     );
 
     quick_connect::QuickConnectStorage::start_cleanup_task(app_state.quick_connect.clone());
@@ -463,8 +482,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_signed(key);
 
     let backend = Backend::new(
-        app_state.config.clone(),
         app_state.user_authorization.clone(),
+        app_state.console_admins.clone(),
     );
     let auth_layer = AuthManagerLayerBuilder::new(backend, session_layer).build();
 

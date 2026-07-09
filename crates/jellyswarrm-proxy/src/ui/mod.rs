@@ -93,6 +93,32 @@ fn get_jellyfin_ui_version() -> Option<JellyfinUiVersion> {
 pub static JELLYFIN_UI_VERSION: LazyLock<Option<JellyfinUiVersion>> =
     LazyLock::new(get_jellyfin_ui_version);
 
+/// Instance-wide settings and admin-account management -- each handler
+/// requires a `SuperAdmin` extractor param (see `admin::ownership`), so
+/// there's no separate router-level gate needed here beyond the outer
+/// `require_admin` (a plain non-superadmin still gets a 403, just from the
+/// handler itself instead of a middleware layer).
+fn superadmin_routes() -> axum::Router<AppState> {
+    Router::new()
+        // Settings
+        .route("/settings", get(admin::settings::settings_page))
+        .route("/settings/form", get(admin::settings::settings_form))
+        .route("/settings/save", post(admin::settings::save_settings))
+        .route("/settings/reload", post(admin::settings::reload_config))
+        // Admins
+        .route("/admins", get(admin::admins::admins_page))
+        .route("/admins", post(admin::admins::add_admin))
+        .route("/admins/list", get(admin::admins::get_admin_list))
+        .route(
+            "/admins/{id}",
+            axum::routing::delete(admin::admins::delete_admin),
+        )
+        .route(
+            "/admins/{id}/password",
+            post(admin::admins::update_admin_password),
+        )
+}
+
 pub fn ui_routes() -> axum::Router<AppState> {
     let admin_routes = Router::new()
         // Users
@@ -132,11 +158,7 @@ pub fn ui_routes() -> axum::Router<AppState> {
             "/servers/{id}/admin",
             axum::routing::delete(admin::servers::delete_server_admin),
         )
-        // Settings
-        .route("/settings", get(admin::settings::settings_page))
-        .route("/settings/form", get(admin::settings::settings_form))
-        .route("/settings/save", post(admin::settings::save_settings))
-        .route("/settings/reload", post(admin::settings::reload_config))
+        .merge(superadmin_routes())
         .route_layer(middleware::from_fn(require_admin));
 
     Router::new()

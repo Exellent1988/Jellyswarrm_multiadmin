@@ -13,6 +13,7 @@ use crate::{
     encryption::{encrypt_password, Password},
     server_id::ServerId,
     server_storage::Server,
+    ui::admin::ownership::{require_owner_or_superadmin, CurrentAdmin},
     AppState,
 };
 
@@ -27,6 +28,9 @@ pub struct ServerWithAdmin {
     pub has_admin: bool,
     pub is_redirect: bool,
     pub is_proxy: bool,
+    /// Owning admin's username, resolved only when the viewer is a
+    /// superadmin (the only audience the owner column is shown to).
+    pub owner_username: Option<String>,
 }
 
 #[derive(Template)]
@@ -34,6 +38,7 @@ pub struct ServerWithAdmin {
 pub struct ServerListTemplate {
     pub servers: Vec<ServerWithAdmin>,
     pub ui_route: String,
+    pub is_superadmin: bool,
 }
 
 #[derive(Deserialize)]
@@ -60,8 +65,24 @@ pub struct AddServerAdminForm {
     pub password: Password,
 }
 
-async fn render_server_list(state: &AppState) -> Result<String, String> {
-    match state.server_storage.list_servers().await {
+/// Servers the viewer is allowed to manage: every server for a superadmin,
+/// only their own otherwise. This is the sole place that decides which
+/// servers show up in the admin UI's list/mutation surface -- the
+/// end-user-facing merged library (`server_storage.list_servers()` called
+/// from federation/handlers code) is never filtered this way.
+async fn visible_servers(
+    state: &AppState,
+    viewer: &CurrentAdmin,
+) -> Result<Vec<Server>, sqlx::Error> {
+    if viewer.is_superadmin {
+        state.server_storage.list_servers().await
+    } else {
+        state.server_storage.list_servers_owned_by(viewer.id).await
+    }
+}
+
+async fn render_server_list(state: &AppState, viewer: &CurrentAdmin) -> Result<String, String> {
+    match visible_servers(state, viewer).await {
         Ok(servers) => {
             let mut servers_with_admin = Vec::new();
             for server in servers {
@@ -72,17 +93,33 @@ async fn render_server_list(state: &AppState) -> Result<String, String> {
                     .unwrap_or(None)
                     .is_some();
                 let is_redirect = server.media_streaming_mode == MediaStreamingMode::Redirect;
+                let owner_username = if viewer.is_superadmin {
+                    match server.owner_admin_id {
+                        Some(owner_id) => state
+                            .console_admins
+                            .get_admin_by_id(owner_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|admin| admin.username),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
                 servers_with_admin.push(ServerWithAdmin {
                     server,
                     has_admin,
                     is_redirect,
                     is_proxy: !is_redirect,
+                    owner_username,
                 });
             }
 
             let template = ServerListTemplate {
                 servers: servers_with_admin,
                 ui_route: state.get_ui_route().await,
+                is_superadmin: viewer.is_superadmin,
             };
 
             template.render().map_err(|e| e.to_string())
@@ -107,8 +144,19 @@ pub async fn servers_page(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// Get server list partial (for HTMX)
-pub async fn get_server_list(State(state): State<AppState>) -> impl IntoResponse {
-    match render_server_list(&state).await {
+pub async fn get_server_list(
+    State(state): State<AppState>,
+    admin: CurrentAdmin,
+) -> impl IntoResponse {
+    server_list_response(&state, &admin).await
+}
+
+/// Renders the server list partial as a `Response`, for handlers that
+/// already have `state`/`admin` in scope and want to return the refreshed
+/// list after a mutation (mirrors what re-calling the `get_server_list`
+/// handler would do, without needing to re-run extraction).
+async fn server_list_response(state: &AppState, admin: &CurrentAdmin) -> Response {
+    match render_server_list(state, admin).await {
         Ok(html) => Html(html).into_response(),
         Err(e) => {
             error!("Failed to render server list: {}", e);
@@ -120,6 +168,7 @@ pub async fn get_server_list(State(state): State<AppState>) -> impl IntoResponse
 /// Add a new server
 pub async fn add_server(
     State(state): State<AppState>,
+    admin: CurrentAdmin,
     Form(form): Form<AddServerForm>,
 ) -> Response {
     // Validate the form data
@@ -158,28 +207,29 @@ pub async fn add_server(
         }
     };
 
-    // Try to add the server
+    // Try to add the server, owned by whoever's creating it.
     match state
         .server_storage
-        .add_server(
+        .add_server_with_owner(
             form.name.trim(),
             form.url.trim(),
             form.priority,
             media_streaming_mode,
+            Some(admin.id),
         )
         .await
     {
         Ok(server_id) => {
             info!(
-                "Added new server: {} ({}) with ID: {}",
-                form.name, form.url, server_id
+                "Added new server: {} ({}) with ID: {} (owner admin {})",
+                form.name, form.url, server_id, admin.id
             );
 
             // Force Update server state
             state.server_storage.check_servers_health().await;
 
             // Return updated server list
-            get_server_list(State(state)).await.into_response()
+            server_list_response(&state, &admin).await
         }
         Err(e) => {
             error!("Failed to add server: {}", e);
@@ -219,9 +269,14 @@ pub async fn add_server(
 /// Update server media streaming mode
 pub async fn update_server_media_streaming_mode(
     State(state): State<AppState>,
+    admin: CurrentAdmin,
     Path(server_id): Path<ServerId>,
     Form(form): Form<UpdateMediaStreamingModeForm>,
 ) -> Response {
+    if let Err(rejection) = require_owner_or_superadmin(&state, &admin, server_id).await {
+        return rejection;
+    }
+
     let media_streaming_mode = match form.media_streaming_mode.parse::<MediaStreamingMode>() {
         Ok(mode) => mode,
         Err(_) => {
@@ -243,7 +298,7 @@ pub async fn update_server_media_streaming_mode(
                 "Updated server {} media streaming mode to {}",
                 server_id, media_streaming_mode
             );
-            get_server_list(State(state)).await.into_response()
+            server_list_response(&state, &admin).await
         }
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -264,8 +319,13 @@ pub async fn update_server_media_streaming_mode(
 /// Delete a server
 pub async fn delete_server(
     State(state): State<AppState>,
+    admin: CurrentAdmin,
     Path(server_id): Path<ServerId>,
 ) -> Response {
+    if let Err(rejection) = require_owner_or_superadmin(&state, &admin, server_id).await {
+        return rejection;
+    }
+
     match state.server_storage.delete_server(server_id).await {
         Ok(true) => {
             state
@@ -274,7 +334,7 @@ pub async fn delete_server(
                 .await;
             info!("Deleted server with ID: {}", server_id);
             // Return updated server list
-            get_server_list(State(state)).await.into_response()
+            server_list_response(&state, &admin).await
         }
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -295,9 +355,14 @@ pub async fn delete_server(
 /// Update server priority
 pub async fn update_server_priority(
     State(state): State<AppState>,
+    admin: CurrentAdmin,
     Path(server_id): Path<ServerId>,
     Form(form): Form<UpdatePriorityForm>,
 ) -> Response {
+    if let Err(rejection) = require_owner_or_superadmin(&state, &admin, server_id).await {
+        return rejection;
+    }
+
     if form.priority < 1 || form.priority > 999 {
         return (
             StatusCode::BAD_REQUEST,
@@ -314,7 +379,7 @@ pub async fn update_server_priority(
         Ok(true) => {
             info!("Updated server {} priority to {}", server_id, form.priority);
             // Return updated server list
-            get_server_list(State(state)).await.into_response()
+            server_list_response(&state, &admin).await
         }
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -335,27 +400,17 @@ pub async fn update_server_priority(
 /// Add server admin
 pub async fn add_server_admin(
     State(state): State<AppState>,
+    admin: CurrentAdmin,
     Path(server_id): Path<ServerId>,
     Form(form): Form<AddServerAdminForm>,
 ) -> Response {
-    // 1. Get server details
-    let server = match state.server_storage.get_server_by_id(server_id).await {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Html("<div style=\"background-color: #e74c3c; color: white; padding: 0.75rem; border-radius: 0.25rem; margin-bottom: 1rem;\">Server not found</div>"),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            error!("Failed to get server: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html("<div style=\"background-color: #e74c3c; color: white; padding: 0.75rem; border-radius: 0.25rem; margin-bottom: 1rem;\">Database error</div>"),
-            )
-                .into_response();
-        }
+    // 1. Get server details, only for the owning admin (or a superadmin) --
+    // this manages the *upstream* Jellyfin admin credentials used for
+    // federation sync, still a management-plane action scoped to whoever
+    // owns the server.
+    let server = match require_owner_or_superadmin(&state, &admin, server_id).await {
+        Ok(server) => server,
+        Err(rejection) => return rejection,
     };
 
     // 2. Verify credentials with upstream Jellyfin and check admin status
@@ -411,7 +466,7 @@ pub async fn add_server_admin(
             {
                 Ok(_) => {
                     info!("Added admin for server {}", server.name);
-                    match render_server_list(&state).await {
+                    match render_server_list(&state, &admin).await {
                         Ok(html) => Html(format!(
                             r#"<div id="server-list" hx-swap-oob="innerHTML">{}</div>"#,
                             html
@@ -454,12 +509,17 @@ pub async fn add_server_admin(
 /// Delete server admin
 pub async fn delete_server_admin(
     State(state): State<AppState>,
+    admin: CurrentAdmin,
     Path(server_id): Path<ServerId>,
 ) -> Response {
+    if let Err(rejection) = require_owner_or_superadmin(&state, &admin, server_id).await {
+        return rejection;
+    }
+
     match state.server_storage.delete_server_admin(server_id).await {
         Ok(true) => {
             info!("Deleted admin for server ID: {}", server_id);
-            get_server_list(State(state)).await.into_response()
+            server_list_response(&state, &admin).await
         }
         Ok(false) => (
             StatusCode::NOT_FOUND,
