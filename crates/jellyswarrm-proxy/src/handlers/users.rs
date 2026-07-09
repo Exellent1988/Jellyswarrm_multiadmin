@@ -121,7 +121,7 @@ pub async fn handle_authenticate_by_name(
         servers.len()
     );
 
-    let mut auth_tasks = Vec::with_capacity(servers.len());
+    let mut mapped_tasks = Vec::with_capacity(servers.len());
 
     let existing_user = state
         .user_authorization
@@ -159,7 +159,7 @@ pub async fn handle_authenticate_by_name(
                         let state = state.clone();
                         let authentication = authentication.clone();
                         let payload = payload.clone();
-                        auth_tasks.push(tokio::spawn(async move {
+                        mapped_tasks.push(tokio::spawn(async move {
                             authenticate_on_server(
                                 state.clone(),
                                 authentication.clone(),
@@ -175,48 +175,15 @@ pub async fn handle_authenticate_by_name(
         }
     }
 
-    // Whatever's left in `servers` has no mapping for this user yet -- probe
-    // it with the freshly-submitted credentials regardless of whether the
-    // user is brand new or already has mappings elsewhere. Without this, a
-    // user whose first-ever login only matched a subset of servers (e.g.
-    // different/nonexistent credentials on another server at the time) would
-    // never automatically pick up that server later, even after it becomes
-    // reachable with the same password -- the only way in would have been an
-    // admin manually adding a mapping. `add_server_mapping` is an upsert
-    // keyed on (user_id, server_id), so re-probing an already-mapped server
-    // here would be harmless too, but there's nothing left to probe for
-    // those since the loop above already removed them from `servers`.
-    if !servers.is_empty() {
-        info!(
-            "Probing {} unmapped server(s) for user '{}'",
-            servers.len(),
-            payload.username
-        );
-    }
-    let mut leftover_tasks: Vec<_> = servers
-        .into_iter()
-        .map(|server| {
-            let state = state.clone();
-            let authentication = authentication.clone();
-            let payload = payload.clone();
-            info!(
-                "No server mapping found for user '{}' on server '{}'",
-                payload.username, server.name
-            );
+    let mapped_server_count = mapped_tasks.len();
 
-            tokio::spawn(async move {
-                authenticate_with_auto_create(state, authentication, payload, server).await
-            })
-        })
-        .collect();
-
-    auth_tasks.append(&mut leftover_tasks);
-
-    // Wait for all authentication attempts to complete
+    // Await the mapped-server attempts *before* deciding how to handle any
+    // unmapped ones. Whether auto-create may run below hinges on whether
+    // this exact login already proved itself with real credentials the
+    // submitter can't have just made up -- that can only be known once these
+    // are in, not while they're still in flight.
     let mut successful_auths: Vec<SuccessfulServerAuth> = Vec::new();
-    let total_servers = auth_tasks.len();
-
-    for task in auth_tasks {
+    for task in mapped_tasks {
         match task.await {
             Ok(Ok(auth_response)) => {
                 info!("Successfully authenticated user: {}", payload.username);
@@ -230,6 +197,120 @@ pub async fn handle_authenticate_by_name(
             }
         }
     }
+
+    // Whatever's left in `servers` has no mapping for this user yet -- probe
+    // it with the freshly-submitted credentials regardless of whether the
+    // user is brand new or already has mappings elsewhere. Without this, a
+    // user whose first-ever login only matched a subset of servers (e.g.
+    // different/nonexistent credentials on another server at the time) would
+    // never automatically pick up that server later, even after it becomes
+    // reachable with the same password -- the only way in would have been an
+    // admin manually adding a mapping. `add_server_mapping` is an upsert
+    // keyed on (user_id, server_id), so re-probing an already-mapped server
+    // here would be harmless too, but there's nothing left to probe for
+    // those since the loop above already removed them from `servers`.
+    //
+    // This is a *plain* probe -- no auto-create yet. Whether auto-create may
+    // run at all depends on whether this same request proves the submitter
+    // already holds valid credentials somewhere, and a server they don't yet
+    // have an account on obviously can't be the server that proves that.
+    if !servers.is_empty() {
+        info!(
+            "Probing {} unmapped server(s) for user '{}'",
+            servers.len(),
+            payload.username
+        );
+    }
+    let unmapped_server_count = servers.len();
+    let unmapped_probe_tasks: Vec<_> = servers
+        .into_iter()
+        .map(|server| {
+            let state = state.clone();
+            let authentication = authentication.clone();
+            let payload = payload.clone();
+            let server_for_retry = server.clone();
+            info!(
+                "No server mapping found for user '{}' on server '{}'",
+                payload.username, server.name
+            );
+
+            tokio::spawn(async move {
+                let result =
+                    authenticate_on_server(state, authentication, payload, server, None).await;
+                (server_for_retry, result)
+            })
+        })
+        .collect();
+
+    let mut unmapped_failures: Vec<crate::server_storage::Server> = Vec::new();
+    for task in unmapped_probe_tasks {
+        match task.await {
+            Ok((_, Ok(auth_response))) => {
+                info!("Successfully authenticated user: {}", payload.username);
+                successful_auths.push(auth_response);
+            }
+            Ok((server, Err(e))) => {
+                tracing::debug!("Authentication attempt failed: {:?}", e);
+                unmapped_failures.push(server);
+            }
+            Err(join_err) => {
+                tracing::error!("Authentication task failed: {}", join_err);
+            }
+        }
+    }
+
+    // Auto-create must never be the *only* thing standing between an
+    // arbitrary username/password and a freshly-provisioned account on every
+    // federated server -- that would turn the login form into open
+    // self-registration. It may only fire once this exact request has
+    // already proven, via a real credential match (an existing mapping OR a
+    // plain probe above), that the submitter genuinely holds valid
+    // credentials somewhere. A brand new username with zero matches
+    // anywhere never satisfies that, no matter how many servers have admin
+    // credentials configured.
+    let user_has_verified_access = !successful_auths.is_empty();
+
+    if user_has_verified_access && !unmapped_failures.is_empty() {
+        info!(
+            "User '{}' already verified this login on {} server(s); retrying {} unmapped server(s) with auto-create",
+            payload.username,
+            successful_auths.len(),
+            unmapped_failures.len()
+        );
+
+        let auto_create_tasks: Vec<_> = unmapped_failures
+            .into_iter()
+            .map(|server| {
+                let state = state.clone();
+                let authentication = authentication.clone();
+                let payload = payload.clone();
+                tokio::spawn(async move {
+                    attempt_auto_create_then_authenticate(state, authentication, payload, server)
+                        .await
+                })
+            })
+            .collect();
+
+        for task in auto_create_tasks {
+            match task.await {
+                Ok(Ok(auth_response)) => {
+                    info!(
+                        "Successfully auto-created and authenticated user: {}",
+                        payload.username
+                    );
+                    successful_auths.push(auth_response);
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("Auto-create authentication attempt failed: {:?}", e);
+                }
+                Err(join_err) => {
+                    tracing::error!("Auto-create authentication task failed: {}", join_err);
+                }
+            }
+        }
+    }
+
+    let total_servers = mapped_server_count + unmapped_server_count;
 
     if successful_auths.is_empty() {
         tracing::warn!(
@@ -453,33 +534,6 @@ async fn authenticate_on_server(
         final_username,
         final_password,
     })
-}
-
-/// Authenticates on a server with no existing mapping; if the plain-credential
-/// probe fails, falls back to `attempt_auto_create_then_authenticate` so that
-/// "Auto Create Users On Login" also covers servers the user has never had an
-/// account on, not just brand-new local proxy users.
-async fn authenticate_with_auto_create(
-    state: AppState,
-    authorization: Authorization,
-    payload: AuthenticateRequest,
-    server: crate::server_storage::Server,
-) -> Result<SuccessfulServerAuth, AuthError> {
-    match authenticate_on_server(
-        state.clone(),
-        authorization.clone(),
-        payload.clone(),
-        server.clone(),
-        None,
-    )
-    .await
-    {
-        Ok(auth) => Ok(auth),
-        Err(AuthError::InvalidCredentials) => {
-            attempt_auto_create_then_authenticate(state, authorization, payload, server).await
-        }
-        Err(e) => Err(e),
-    }
 }
 
 /// Creates (or verifies) the submitted credentials as a real account on
@@ -849,8 +903,53 @@ mod tests {
             .unwrap();
     }
 
+    /// Sets up two servers: `server_a` is already mapped for `username` with
+    /// working credentials (so a login proves "verified access" this
+    /// request); `server_b` has admin creds configured but no mapping yet,
+    /// and no account for `username` -- the auto-create candidate.
+    async fn setup_verified_user_plus_auto_create_candidate(
+        state: &AppState,
+        username: &str,
+        password: &str,
+    ) -> (MockServer, MockServer) {
+        let mock_a = MockServer::start().await;
+        let mock_b = MockServer::start().await;
+        mount_authenticate_success(&mock_a, username).await;
+
+        let server_a_id = state
+            .server_storage
+            .add_server("Server A", &mock_a.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+        let server_a = state
+            .server_storage
+            .get_server_by_id(server_a_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let server_b_id = state
+            .server_storage
+            .add_server("Server B", &mock_b.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+        add_server_admin_creds(state, server_b_id).await;
+
+        let user = state
+            .user_authorization
+            .get_or_create_user(username, &password.into())
+            .await
+            .unwrap();
+        state
+            .user_authorization
+            .add_server_mapping(&user.id, &server_a, username, &password.into(), None)
+            .await
+            .unwrap();
+
+        (mock_a, mock_b)
+    }
+
     #[tokio::test]
-    async fn auto_create_on_login_creates_missing_account_on_unmapped_server() {
+    async fn auto_create_fires_only_for_a_user_already_verified_on_another_server_this_login() {
         use wiremock::matchers::body_partial_json;
 
         let state = create_test_app_state().await;
@@ -859,54 +958,51 @@ mod tests {
             "auto-create should default to on"
         );
 
-        let mock = MockServer::start().await;
-        let server_id = state
-            .server_storage
-            .add_server("Server A", &mock.uri(), 100, MediaStreamingMode::Redirect)
-            .await
-            .unwrap();
-        add_server_admin_creds(&state, server_id).await;
+        let (_mock_a, mock_b) =
+            setup_verified_user_plus_auto_create_candidate(&state, "verifieduser", "correct-pw")
+                .await;
 
-        // Admin login for the sync/federation path.
+        // Admin login on server B for the sync/federation path.
         Mock::given(method("POST"))
             .and(path("/Users/AuthenticateByName"))
             .and(body_partial_json(serde_json::json!({"Username": "admin"})))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(mock_authenticate_response("admin")),
             )
-            .mount(&mock)
+            .mount(&mock_b)
             .await;
 
-        // The user's very first plain-credential probe fails (no account yet).
+        // The user's very first plain-credential probe on B fails (no account there yet).
         Mock::given(method("POST"))
             .and(path("/Users/AuthenticateByName"))
             .and(body_partial_json(
-                serde_json::json!({"Username": "newuser"}),
+                serde_json::json!({"Username": "verifieduser"}),
             ))
             .respond_with(ResponseTemplate::new(401))
             .up_to_n_times(1)
             .with_priority(1)
-            .mount(&mock)
+            .mount(&mock_b)
             .await;
 
         // After auto-create, the retry succeeds.
         Mock::given(method("POST"))
             .and(path("/Users/AuthenticateByName"))
             .and(body_partial_json(
-                serde_json::json!({"Username": "newuser"}),
+                serde_json::json!({"Username": "verifieduser"}),
             ))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(mock_authenticate_response("newuser")),
+                ResponseTemplate::new(200)
+                    .set_body_json(mock_authenticate_response("verifieduser")),
             )
             .with_priority(2)
-            .mount(&mock)
+            .mount(&mock_b)
             .await;
 
-        // No account exists remotely yet.
+        // No account exists remotely yet on B.
         Mock::given(method("GET"))
             .and(path("/Users"))
             .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
-            .mount(&mock)
+            .mount(&mock_b)
             .await;
 
         // Account creation call.
@@ -914,19 +1010,19 @@ mod tests {
             .and(path("/Users/New"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Id": "remote-new-user-id",
-                "Name": "newuser",
+                "Name": "verifieduser",
                 "ServerId": "upstream-server",
                 "Policy": {"IsAdministrator": false, "SyncPlayAccess": "None"},
             })))
-            .mount(&mock)
+            .mount(&mock_b)
             .await;
 
         let response = handle_authenticate_by_name(
             State(state.clone()),
             login_headers(),
             Json(AuthenticateRequest {
-                username: "newuser".to_string(),
-                password: "some-password".into(),
+                username: "verifieduser".to_string(),
+                password: "correct-pw".into(),
             }),
         )
         .await
@@ -939,17 +1035,136 @@ mod tests {
             .unwrap();
         assert_eq!(
             mappings.len(),
-            1,
-            "auto-created account should be mapped locally"
+            2,
+            "should now be mapped to both the already-verified server and the auto-created one"
         );
-        assert_eq!(mappings[0].mapped_username, "newuser");
     }
 
     #[tokio::test]
-    async fn blocked_user_is_not_auto_created_on_login() {
+    async fn first_ever_login_with_real_accounts_on_some_servers_auto_creates_the_rest() {
+        // The scenario that matters most: this user has NEVER logged into
+        // jellyswarm before (no local user, no mappings at all), but already
+        // has real, valid Jellyfin accounts on 2 of 3 configured servers.
+        // Because two of those three succeed via genuine credential matches
+        // in this very request, that's proof enough to auto-create the
+        // account on the third (which has admin creds configured but no
+        // matching account yet) -- without ever having needed a pre-existing
+        // mapping to establish trust.
         use wiremock::matchers::body_partial_json;
 
         let state = create_test_app_state().await;
+
+        let mock_a = MockServer::start().await;
+        let mock_b = MockServer::start().await;
+        let mock_c = MockServer::start().await;
+        mount_authenticate_success(&mock_a, "multiuser").await;
+        mount_authenticate_success(&mock_b, "multiuser").await;
+
+        state
+            .server_storage
+            .add_server("Server A", &mock_a.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+        state
+            .server_storage
+            .add_server("Server B", &mock_b.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+        let server_c_id = state
+            .server_storage
+            .add_server("Server C", &mock_c.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+        add_server_admin_creds(&state, server_c_id).await;
+
+        // Admin login on C for the sync/federation path.
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .and(body_partial_json(serde_json::json!({"Username": "admin"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_authenticate_response("admin")),
+            )
+            .mount(&mock_c)
+            .await;
+
+        // The user's first plain-credential probe on C fails (no account there yet).
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .and(body_partial_json(
+                serde_json::json!({"Username": "multiuser"}),
+            ))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&mock_c)
+            .await;
+
+        // After auto-create, the retry succeeds.
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .and(body_partial_json(
+                serde_json::json!({"Username": "multiuser"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_authenticate_response("multiuser")),
+            )
+            .with_priority(2)
+            .mount(&mock_c)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/Users"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&mock_c)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/Users/New"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Id": "remote-new-user-id",
+                "Name": "multiuser",
+                "ServerId": "upstream-server",
+                "Policy": {"IsAdministrator": false, "SyncPlayAccess": "None"},
+            })))
+            .mount(&mock_c)
+            .await;
+
+        let response = handle_authenticate_by_name(
+            State(state.clone()),
+            login_headers(),
+            Json(AuthenticateRequest {
+                username: "multiuser".to_string(),
+                password: "correct-pw".into(),
+            }),
+        )
+        .await
+        .expect("login should succeed via A and B, and auto-create on C");
+
+        let mappings = state
+            .user_authorization
+            .list_server_mappings(&response.0.user.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            mappings.len(),
+            3,
+            "should be mapped to A and B (real accounts) plus C (auto-created)"
+        );
+    }
+
+    #[tokio::test]
+    async fn brand_new_username_is_never_auto_created_anywhere() {
+        // The critical guard: a completely unknown username/password combo
+        // must NOT get an account auto-provisioned on a server just because
+        // that server has admin credentials configured and the toggle is
+        // on. Auto-create may only ever kick in for someone who has already
+        // proven, in this same request, that they hold valid credentials on
+        // at least one other server -- otherwise the login form becomes
+        // open self-registration onto every federated server.
+        use wiremock::matchers::body_partial_json;
+
+        let state = create_test_app_state().await;
+        assert!(state.auto_create_users_on_login().await);
 
         let mock = MockServer::start().await;
         let server_id = state
@@ -959,20 +1174,16 @@ mod tests {
             .unwrap();
         add_server_admin_creds(&state, server_id).await;
 
-        state
-            .user_authorization
-            .block_user_on_server(server_id, "kicked", None)
-            .await
-            .unwrap();
-
         // Only the failing plain-credential probe should ever be hit -- if
-        // the auto-create path incorrectly ran anyway, there'd be no mock
-        // for the admin auth/list/create calls it would try to make, and
-        // this test would fail with a connection/parse error instead of a
-        // clean 401, making the bug visible either way.
+        // auto-create incorrectly ran anyway, there'd be no mock for the
+        // admin auth/list/create calls it would try to make, and this test
+        // would fail with a connection/parse error instead of a clean 401,
+        // making the bug visible either way.
         Mock::given(method("POST"))
             .and(path("/Users/AuthenticateByName"))
-            .and(body_partial_json(serde_json::json!({"Username": "kicked"})))
+            .and(body_partial_json(
+                serde_json::json!({"Username": "totally-new-nobody"}),
+            ))
             .respond_with(ResponseTemplate::new(401))
             .mount(&mock)
             .await;
@@ -981,8 +1192,8 @@ mod tests {
             State(state.clone()),
             login_headers(),
             Json(AuthenticateRequest {
-                username: "kicked".to_string(),
-                password: "some-password".into(),
+                username: "totally-new-nobody".to_string(),
+                password: "whatever-i-just-typed".into(),
             }),
         )
         .await;
@@ -991,19 +1202,74 @@ mod tests {
 
         let user = state
             .user_authorization
-            .get_user_by_username("kicked")
+            .get_user_by_username("totally-new-nobody")
             .await
             .unwrap();
-        if let Some(user) = user {
-            let mappings = state
-                .user_authorization
-                .list_server_mappings(&user.id)
-                .await
-                .unwrap();
-            assert!(
-                mappings.is_empty(),
-                "blocked user must not get a mapping created on the blocked server"
-            );
-        }
+        assert!(
+            user.is_none(),
+            "a failed login for an unknown user must not create a local user record either"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_user_is_not_auto_created_even_when_verified_elsewhere() {
+        use wiremock::matchers::body_partial_json;
+
+        let state = create_test_app_state().await;
+
+        let (_mock_a, mock_b) =
+            setup_verified_user_plus_auto_create_candidate(&state, "kicked", "correct-pw").await;
+
+        let server_b_id = state
+            .server_storage
+            .list_servers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "Server B")
+            .unwrap()
+            .id;
+
+        state
+            .user_authorization
+            .block_user_on_server(server_b_id, "kicked", None)
+            .await
+            .unwrap();
+
+        // Only the failing plain-credential probe on B should ever be hit --
+        // if auto-create incorrectly ran despite the block, there'd be no
+        // mock for the admin auth/list/create calls it would try to make.
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .and(body_partial_json(serde_json::json!({"Username": "kicked"})))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_b)
+            .await;
+
+        let response = handle_authenticate_by_name(
+            State(state.clone()),
+            login_headers(),
+            Json(AuthenticateRequest {
+                username: "kicked".to_string(),
+                password: "correct-pw".into(),
+            }),
+        )
+        .await
+        .expect("login should still succeed via the already-mapped, non-blocked server A");
+
+        let mappings = state
+            .user_authorization
+            .list_server_mappings(&response.0.user.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            mappings.len(),
+            1,
+            "blocked user must not get a mapping created on the blocked server"
+        );
+        assert_ne!(
+            mappings[0].server_id, server_b_id,
+            "the surviving mapping must be server A, not the blocked server B"
+        );
     }
 }
