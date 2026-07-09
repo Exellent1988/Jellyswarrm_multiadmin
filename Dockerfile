@@ -3,9 +3,6 @@
 #################################
 FROM node:20-alpine AS ui-build
 
-# Install git for version detection
-RUN apk add --no-cache git
-
 WORKDIR /app/ui
 
 # Copy package files for dependency caching
@@ -15,16 +12,20 @@ COPY ui/package.json ui/package-lock.json* ./
 RUN --mount=type=cache,target=/root/.npm \
     npm install --engine-strict=false --ignore-scripts
 
-# Copy UI source code and git metadata
+# Copy UI source code
 COPY ui/ ./
-COPY .git/modules/ui/ /app/.git/modules/ui/
 
-# Get and print UI version info. `git describe --tags` needs tag history,
-# which isn't necessarily present for a submodule checked out via a shallow
-# clone (e.g. Docker's remote git build context) -- fall back to "unknown"
-# rather than failing the build over version-string cosmetics.
-RUN UI_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "unknown") && \
-    UI_COMMIT=$(git rev-parse HEAD) && \
+# Get and print UI version info. This intentionally does NOT use git (no
+# `git describe`/`rev-parse`, no `.git/modules/ui` in the build context):
+# some build backends (e.g. Arcane's remote deploy, which calls the Docker
+# Engine API directly rather than the `docker compose`/`buildx` CLI) don't
+# apply CLI-only conveniences like `BUILDKIT_CONTEXT_KEEP_GIT_DIR`, so a
+# remote git build context can't reliably be assumed to carry `.git`
+# metadata through to this stage. `package.json`'s own version field is
+# always present regardless of build backend; the commit hash is cosmetic
+# and falls back to "unknown" when not supplied.
+ARG UI_COMMIT=unknown
+RUN UI_VERSION=$(node -p "require('./package.json').version") && \
     echo "UI_VERSION=${UI_VERSION#v}" && \
     echo "UI_COMMIT=$UI_COMMIT"
 
@@ -32,8 +33,7 @@ RUN UI_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "unknown") &
 RUN npm run build:production
 
 # Write ui-version.env file
-RUN UI_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "unknown") && \
-    UI_COMMIT=$(git rev-parse HEAD) && \
+RUN UI_VERSION=$(node -p "require('./package.json').version") && \
     printf "UI_VERSION=%s\nUI_COMMIT=%s\n" "${UI_VERSION#v}" "$UI_COMMIT" > dist/ui-version.env && \
     echo "Generated dist/ui-version.env"
 
