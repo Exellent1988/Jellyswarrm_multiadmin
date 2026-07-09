@@ -205,7 +205,7 @@ pub async fn handle_authenticate_by_name(
             );
 
             tokio::spawn(async move {
-                authenticate_on_server(state, authentication, payload, server, None).await
+                authenticate_with_auto_create(state, authentication, payload, server).await
             })
         })
         .collect();
@@ -453,6 +453,109 @@ async fn authenticate_on_server(
         final_username,
         final_password,
     })
+}
+
+/// Authenticates on a server with no existing mapping; if the plain-credential
+/// probe fails, falls back to `attempt_auto_create_then_authenticate` so that
+/// "Auto Create Users On Login" also covers servers the user has never had an
+/// account on, not just brand-new local proxy users.
+async fn authenticate_with_auto_create(
+    state: AppState,
+    authorization: Authorization,
+    payload: AuthenticateRequest,
+    server: crate::server_storage::Server,
+) -> Result<SuccessfulServerAuth, AuthError> {
+    match authenticate_on_server(
+        state.clone(),
+        authorization.clone(),
+        payload.clone(),
+        server.clone(),
+        None,
+    )
+    .await
+    {
+        Ok(auth) => Ok(auth),
+        Err(AuthError::InvalidCredentials) => {
+            attempt_auto_create_then_authenticate(state, authorization, payload, server).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Creates (or verifies) the submitted credentials as a real account on
+/// `server` via the same admin-credential path used for federated user sync,
+/// then retries the plain-credential login once. Never recreates a user an
+/// admin has explicitly kicked-and-blocked from that server (see
+/// `user_authorization_service::block_user_on_server`).
+async fn attempt_auto_create_then_authenticate(
+    state: AppState,
+    authorization: Authorization,
+    payload: AuthenticateRequest,
+    server: crate::server_storage::Server,
+) -> Result<SuccessfulServerAuth, AuthError> {
+    if !state.auto_create_users_on_login().await {
+        return Err(AuthError::InvalidCredentials);
+    }
+
+    match state
+        .user_authorization
+        .is_user_blocked_on_server(server.id, &payload.username)
+        .await
+    {
+        Ok(true) => {
+            info!(
+                "Not auto-creating user '{}' on server '{}': blocked by an admin",
+                payload.username, server.name
+            );
+            return Err(AuthError::InvalidCredentials);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            error!(
+                "Failed to check user block status on server '{}': {}",
+                server.name, e
+            );
+            return Err(AuthError::InvalidCredentials);
+        }
+    }
+
+    let user = match state
+        .user_authorization
+        .get_or_create_user(&payload.username, &payload.password)
+        .await
+    {
+        Ok(u) => u,
+        Err(e) => {
+            error!(
+                "Failed to resolve local user for auto-create on server '{}': {}",
+                server.name, e
+            );
+            return Err(AuthError::InvalidCredentials);
+        }
+    };
+
+    let sync_result = state
+        .federated_users
+        .sync_user_to_server(&server, &payload.username, &payload.password, &user.id)
+        .await;
+
+    match sync_result.status {
+        crate::federated_users::SyncStatus::Created
+        | crate::federated_users::SyncStatus::AlreadyExists => {
+            info!(
+                "Auto-created/synced user '{}' on server '{}' during login; retrying authentication",
+                payload.username, server.name
+            );
+            authenticate_on_server(state, authorization, payload, server, None).await
+        }
+        other_status => {
+            debug!(
+                "Auto-create on server '{}' for user '{}' did not yield a usable account (status: {:?})",
+                server.name, payload.username, other_status
+            );
+            Err(AuthError::InvalidCredentials)
+        }
+    }
 }
 
 /// Extracts authorization header
@@ -732,5 +835,175 @@ mod tests {
             2,
             "brand new user should map to both servers"
         );
+    }
+
+    async fn add_server_admin_creds(state: &AppState, server_id: crate::server_id::ServerId) {
+        let master_password: crate::encryption::HashedPassword =
+            state.config.read().await.password.clone().into();
+        let encrypted =
+            crate::encryption::encrypt_password(&"admin-secret".into(), &master_password).unwrap();
+        state
+            .server_storage
+            .add_server_admin(server_id, "admin", &encrypted)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_create_on_login_creates_missing_account_on_unmapped_server() {
+        use wiremock::matchers::body_partial_json;
+
+        let state = create_test_app_state().await;
+        assert!(
+            state.auto_create_users_on_login().await,
+            "auto-create should default to on"
+        );
+
+        let mock = MockServer::start().await;
+        let server_id = state
+            .server_storage
+            .add_server("Server A", &mock.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+        add_server_admin_creds(&state, server_id).await;
+
+        // Admin login for the sync/federation path.
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .and(body_partial_json(serde_json::json!({"Username": "admin"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_authenticate_response("admin")),
+            )
+            .mount(&mock)
+            .await;
+
+        // The user's very first plain-credential probe fails (no account yet).
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .and(body_partial_json(
+                serde_json::json!({"Username": "newuser"}),
+            ))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&mock)
+            .await;
+
+        // After auto-create, the retry succeeds.
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .and(body_partial_json(
+                serde_json::json!({"Username": "newuser"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_authenticate_response("newuser")),
+            )
+            .with_priority(2)
+            .mount(&mock)
+            .await;
+
+        // No account exists remotely yet.
+        Mock::given(method("GET"))
+            .and(path("/Users"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&mock)
+            .await;
+
+        // Account creation call.
+        Mock::given(method("POST"))
+            .and(path("/Users/New"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Id": "remote-new-user-id",
+                "Name": "newuser",
+                "ServerId": "upstream-server",
+                "Policy": {"IsAdministrator": false, "SyncPlayAccess": "None"},
+            })))
+            .mount(&mock)
+            .await;
+
+        let response = handle_authenticate_by_name(
+            State(state.clone()),
+            login_headers(),
+            Json(AuthenticateRequest {
+                username: "newuser".to_string(),
+                password: "some-password".into(),
+            }),
+        )
+        .await
+        .expect("login should succeed after auto-create");
+
+        let mappings = state
+            .user_authorization
+            .list_server_mappings(&response.0.user.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            mappings.len(),
+            1,
+            "auto-created account should be mapped locally"
+        );
+        assert_eq!(mappings[0].mapped_username, "newuser");
+    }
+
+    #[tokio::test]
+    async fn blocked_user_is_not_auto_created_on_login() {
+        use wiremock::matchers::body_partial_json;
+
+        let state = create_test_app_state().await;
+
+        let mock = MockServer::start().await;
+        let server_id = state
+            .server_storage
+            .add_server("Server A", &mock.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+        add_server_admin_creds(&state, server_id).await;
+
+        state
+            .user_authorization
+            .block_user_on_server(server_id, "kicked", None)
+            .await
+            .unwrap();
+
+        // Only the failing plain-credential probe should ever be hit -- if
+        // the auto-create path incorrectly ran anyway, there'd be no mock
+        // for the admin auth/list/create calls it would try to make, and
+        // this test would fail with a connection/parse error instead of a
+        // clean 401, making the bug visible either way.
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .and(body_partial_json(serde_json::json!({"Username": "kicked"})))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock)
+            .await;
+
+        let result = handle_authenticate_by_name(
+            State(state.clone()),
+            login_headers(),
+            Json(AuthenticateRequest {
+                username: "kicked".to_string(),
+                password: "some-password".into(),
+            }),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+
+        let user = state
+            .user_authorization
+            .get_user_by_username("kicked")
+            .await
+            .unwrap();
+        if let Some(user) = user {
+            let mappings = state
+                .user_authorization
+                .list_server_mappings(&user.id)
+                .await
+                .unwrap();
+            assert!(
+                mappings.is_empty(),
+                "blocked user must not get a mapping created on the blocked server"
+            );
+        }
     }
 }

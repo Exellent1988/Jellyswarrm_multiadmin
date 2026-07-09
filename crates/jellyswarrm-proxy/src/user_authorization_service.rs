@@ -49,6 +49,27 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for ServerMapping {
 }
 
 #[derive(Debug, Clone)]
+pub struct ServerUserBlock {
+    pub id: i64,
+    pub server_id: ServerId,
+    pub username: String,
+    pub blocked_by_admin_id: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl<'r> sqlx::FromRow<'r, SqliteRow> for ServerUserBlock {
+    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            server_id: ServerId::new(row.try_get("server_id")?),
+            username: row.try_get("username")?,
+            blocked_by_admin_id: row.try_get("blocked_by_admin_id")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct AuthorizationSession {
     pub id: i64,
     pub user_id: String,
@@ -1366,6 +1387,95 @@ impl UserAuthorizationService {
             .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
         Ok(servers)
+    }
+
+    /// Block a username from being (re)created on a specific server, e.g.
+    /// after an admin kicks them. Idempotent -- blocking an already-blocked
+    /// username on the same server just leaves the existing block in place.
+    pub async fn block_user_on_server(
+        &self,
+        server_id: ServerId,
+        username: &str,
+        blocked_by_admin_id: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        let username_key = Self::normalized_username_key(username);
+        let now = chrono::Utc::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO server_user_blocks (server_id, username, blocked_by_admin_id, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(server_id, username) DO NOTHING
+            "#,
+        )
+        .bind(server_id.as_i64())
+        .bind(&username_key)
+        .bind(blocked_by_admin_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Lift a block, allowing the username to be mapped/auto-created on that
+    /// server again.
+    pub async fn unblock_user_on_server(
+        &self,
+        server_id: ServerId,
+        username: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            r#"
+            DELETE FROM server_user_blocks
+            WHERE server_id = ? AND lower(trim(username)) = lower(trim(?))
+            "#,
+        )
+        .bind(server_id.as_i64())
+        .bind(username)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Whether a username is currently blocked on a given server.
+    pub async fn is_user_blocked_on_server(
+        &self,
+        server_id: ServerId,
+        username: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM server_user_blocks
+            WHERE server_id = ? AND lower(trim(username)) = lower(trim(?))
+            "#,
+        )
+        .bind(server_id.as_i64())
+        .bind(username)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count > 0)
+    }
+
+    /// List all blocks in effect for a given server (for admin UI display).
+    pub async fn list_blocks_for_server(
+        &self,
+        server_id: ServerId,
+    ) -> Result<Vec<ServerUserBlock>, sqlx::Error> {
+        sqlx::query_as::<_, ServerUserBlock>(
+            r#"
+            SELECT id, server_id, username, blocked_by_admin_id, created_at
+            FROM server_user_blocks
+            WHERE server_id = ?
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(server_id.as_i64())
+        .fetch_all(&self.pool)
+        .await
     }
 }
 
@@ -3091,5 +3201,61 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!(sessions_after.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_user_block_lifecycle() {
+        let (pool, service) = setup_service().await;
+        let server_a = insert_test_server(&pool, "Server A", "http://localhost:8096").await;
+        let server_b = insert_test_server(&pool, "Server B", "http://localhost:8097").await;
+
+        assert!(!service
+            .is_user_blocked_on_server(server_a, "Exellent")
+            .await
+            .unwrap());
+
+        service
+            .block_user_on_server(server_a, "Exellent", Some(1))
+            .await
+            .unwrap();
+
+        // Blocked on A, case-insensitively, but not on B.
+        assert!(service
+            .is_user_blocked_on_server(server_a, "exellent")
+            .await
+            .unwrap());
+        assert!(!service
+            .is_user_blocked_on_server(server_b, "Exellent")
+            .await
+            .unwrap());
+
+        // Idempotent: blocking again doesn't error or duplicate.
+        service
+            .block_user_on_server(server_a, "Exellent", Some(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .list_blocks_for_server(server_a)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let unblocked = service
+            .unblock_user_on_server(server_a, "exellent")
+            .await
+            .unwrap();
+        assert!(unblocked);
+        assert!(!service
+            .is_user_blocked_on_server(server_a, "Exellent")
+            .await
+            .unwrap());
+        assert!(service
+            .list_blocks_for_server(server_a)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

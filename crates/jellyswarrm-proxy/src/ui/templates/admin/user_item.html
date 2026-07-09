@@ -15,14 +15,25 @@
                 <div><small>Mapped user: {{ mapping.mapped_username }}</small></div>
                 <div><small>Sessions: {{ scount }}</small></div>
             </div>
-            <button
-                class="outline"
-                hx-delete="/{{ ui_route }}/users/{{ uwm.user.id }}/mappings/{{ mapping.id }}"
-                hx-target="#user-{{ uwm.user.id }}"
-                hx-swap="outerHTML settle:300ms"
-                hx-confirm="Delete mapping '{{ server.name }}' for user '{{ uwm.user.original_username }}'?"
-                style="margin-bottom:0;"
-            >Remove</button>
+            <div style="display:flex; gap:0.5rem;">
+                <button
+                    class="outline"
+                    hx-delete="/{{ ui_route }}/users/{{ uwm.user.id }}/mappings/{{ mapping.id }}"
+                    hx-target="#user-{{ uwm.user.id }}"
+                    hx-swap="outerHTML settle:300ms"
+                    hx-confirm="Delete mapping '{{ server.name }}' for user '{{ uwm.user.original_username }}'?"
+                    style="margin-bottom:0;"
+                >Remove</button>
+                <button
+                    class="outline contrast"
+                    hx-post="/{{ ui_route }}/users/{{ uwm.user.id }}/mappings/{{ mapping.id }}/kick"
+                    hx-target="#user-{{ uwm.user.id }}"
+                    hx-swap="outerHTML settle:300ms"
+                    hx-confirm="Kick '{{ uwm.user.original_username }}' from '{{ server.name }}'? This deletes their real Jellyfin account on that server and blocks them from being recreated there automatically."
+                    title="Delete the real account on this server and block future auto-recreation"
+                    style="margin-bottom:0;"
+                >Kick &amp; Block</button>
+            </div>
         </div>
         {% endfor %}
     </section>

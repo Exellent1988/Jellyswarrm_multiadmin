@@ -573,6 +573,129 @@ pub async fn delete_mapping(
     }
 }
 
+/// Kick a user from one of their mapped servers: deletes the real upstream
+/// Jellyfin account there (owner-scoped, same as `delete_mapping`), removes
+/// the local mapping/sessions, and blocks the username on that server so
+/// "Auto Create Users On Login" can never silently recreate it.
+pub async fn kick_user(
+    State(state): State<AppState>,
+    admin: CurrentAdmin,
+    Path((user_id, mapping_id)): Path<(String, i64)>,
+) -> Response {
+    let mapping = match state
+        .user_authorization
+        .get_server_mapping_by_id(mapping_id)
+        .await
+    {
+        Ok(Some(mapping)) => mapping,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Html("<div class=\"alert alert-error\">Mapping not found</div>"),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!("Failed to load mapping {}: {}", mapping_id, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+        }
+    };
+
+    let server = match state
+        .server_storage
+        .get_server_by_id(mapping.server_id)
+        .await
+    {
+        Ok(Some(server)) => server,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Html("<div class=\"alert alert-error\">Server not found</div>"),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!("Failed to load server for mapping {}: {}", mapping_id, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+        }
+    };
+
+    if !may_act_on(&admin, &server) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let username = match state.user_authorization.get_user_by_id(&user_id).await {
+        Ok(Some(u)) => u.original_username,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Html("<div class=\"alert alert-error\">User not found</div>"),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!("Failed to fetch user by id {}: {}", user_id, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+        }
+    };
+
+    let sync_result = state
+        .federated_users
+        .delete_user_from_server(&server, &username)
+        .await;
+
+    if let Err(e) = state
+        .user_authorization
+        .delete_server_mapping(mapping_id)
+        .await
+    {
+        error!(
+            "Failed to delete local mapping {} while kicking user: {}",
+            mapping_id, e
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html("<div class=\"alert alert-error\">Failed to remove local mapping</div>"),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = state
+        .user_authorization
+        .block_user_on_server(server.id, &username, Some(admin.id.as_i64()))
+        .await
+    {
+        error!(
+            "Failed to record block for user '{}' on server '{}': {}",
+            username, server.name, e
+        );
+        return user_item_with_popup(
+            &state,
+            &user_id,
+            format!(
+                "Kicked '{}' from '{}' but failed to persist the block -- they may be recreated on next login.",
+                username, server.name
+            ),
+        )
+        .await;
+    }
+
+    info!(
+        "Kicked and blocked user '{}' on server '{}' (remote delete status: {:?})",
+        username, server.name, sync_result.status
+    );
+
+    user_item_with_popup(
+        &state,
+        &user_id,
+        format!(
+            "Kicked '{}' from '{}' (remote account: {:?}). They will not be auto-recreated there.",
+            username, server.name, sync_result.status
+        ),
+    )
+    .await
+}
+
 /// Delete sessions
 pub async fn delete_sessions(
     State(state): State<AppState>,
@@ -592,5 +715,213 @@ pub async fn delete_sessions(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod kick_tests {
+    use super::*;
+    use crate::{
+        admin_id::AdminId,
+        config::{AppConfig, MediaStreamingMode, MIGRATOR},
+        console_admin_service::ConsoleAdminService,
+        encryption::{encrypt_password, HashedPassword},
+        media_storage_service::MediaStorageService,
+        session_storage::SessionStorage,
+        user_authorization_service::UserAuthorizationService,
+        DataContext, ProxyProcessors,
+    };
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    async fn create_test_app_state() -> AppState {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+
+        let data_context = DataContext {
+            user_authorization: Arc::new(UserAuthorizationService::new(pool.clone())),
+            server_storage: Arc::new(crate::server_storage::ServerStorageService::new(
+                pool.clone(),
+            )),
+            media_storage: Arc::new(MediaStorageService::new(pool.clone())),
+            merged_library_service: Arc::new(
+                crate::merged_library_service::MergedLibraryService::new(pool.clone()),
+            ),
+            play_sessions: Arc::new(SessionStorage::new()),
+            config: Arc::new(tokio::sync::RwLock::new(AppConfig::default())),
+        };
+
+        let processors = ProxyProcessors::new(data_context.clone());
+
+        AppState::new(
+            reqwest::Client::new(),
+            reqwest::Client::new(),
+            data_context,
+            processors,
+            crate::handlers::quick_connect::QuickConnectStorage::new(),
+            Arc::new(ConsoleAdminService::new(pool)),
+        )
+    }
+
+    async fn setup_server_with_mapped_user(
+        state: &AppState,
+        owner: Option<AdminId>,
+    ) -> (crate::server_storage::Server, User, i64, MockServer) {
+        let mock = MockServer::start().await;
+
+        let server_id = state
+            .server_storage
+            .add_server_with_owner(
+                "Server A",
+                &mock.uri(),
+                100,
+                MediaStreamingMode::Redirect,
+                owner,
+            )
+            .await
+            .unwrap();
+        let server = state
+            .server_storage
+            .get_server_by_id(server_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let master_password: HashedPassword = state.config.read().await.password.clone().into();
+        let encrypted_admin_password =
+            encrypt_password(&"admin-secret".into(), &master_password).unwrap();
+        state
+            .server_storage
+            .add_server_admin(server_id, "admin", &encrypted_admin_password)
+            .await
+            .unwrap();
+
+        let user = state
+            .user_authorization
+            .create_user("kickme", &"userpass".into())
+            .await
+            .unwrap();
+        let mapping_id = state
+            .user_authorization
+            .add_server_mapping(&user.id, &server, "kickme", &"userpass".into(), None)
+            .await
+            .unwrap();
+
+        // Admin auth for the remote delete call.
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "AccessToken": "admin-token",
+                "ServerId": "upstream-server",
+                "User": {
+                    "Id": "admin-id", "Name": "admin", "ServerId": "upstream-server",
+                    "Policy": {"IsAdministrator": true, "SyncPlayAccess": "None"}
+                },
+                "SessionInfo": {"UserId": "admin-id", "UserName": "admin", "ServerId": "upstream-server"}
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/Users"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(vec![serde_json::json!({
+                    "Id": "remote-kickme-id", "Name": "kickme", "ServerId": "upstream-server",
+                    "Policy": {"IsAdministrator": false, "SyncPlayAccess": "None"}
+                })]),
+            )
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/Users/remote-kickme-id"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&mock)
+            .await;
+
+        (server, user, mapping_id, mock)
+    }
+
+    #[tokio::test]
+    async fn kick_removes_mapping_and_blocks_recreation() {
+        let state = create_test_app_state().await;
+        let owner = AdminId::new(1);
+        let (server, user, mapping_id, _mock) =
+            setup_server_with_mapped_user(&state, Some(owner)).await;
+
+        let admin = CurrentAdmin {
+            id: owner,
+            is_superadmin: false,
+        };
+
+        let response = kick_user(
+            State(state.clone()),
+            admin,
+            Path((user.id.clone(), mapping_id)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mappings = state
+            .user_authorization
+            .list_server_mappings(&user.id)
+            .await
+            .unwrap();
+        assert!(mappings.is_empty(), "mapping should be removed after kick");
+
+        assert!(
+            state
+                .user_authorization
+                .is_user_blocked_on_server(server.id, "kickme")
+                .await
+                .unwrap(),
+            "user should be blocked on the server after kick"
+        );
+    }
+
+    #[tokio::test]
+    async fn kick_forbidden_for_non_owning_admin() {
+        let state = create_test_app_state().await;
+        let owner = AdminId::new(1);
+        let other_admin = AdminId::new(2);
+        let (server, user, mapping_id, _mock) =
+            setup_server_with_mapped_user(&state, Some(owner)).await;
+
+        let admin = CurrentAdmin {
+            id: other_admin,
+            is_superadmin: false,
+        };
+
+        let response = kick_user(
+            State(state.clone()),
+            admin,
+            Path((user.id.clone(), mapping_id)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let mappings = state
+            .user_authorization
+            .list_server_mappings(&user.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            mappings.len(),
+            1,
+            "mapping must survive a forbidden kick attempt"
+        );
+
+        assert!(
+            !state
+                .user_authorization
+                .is_user_blocked_on_server(server.id, "kickme")
+                .await
+                .unwrap(),
+            "user must not be blocked when the kick attempt was forbidden"
+        );
     }
 }

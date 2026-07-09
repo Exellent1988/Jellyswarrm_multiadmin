@@ -4,7 +4,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     encryption::{decrypt_password, HashedPassword, Password},
-    server_storage::ServerStorageService,
+    server_storage::{Server, ServerStorageService},
     user_authorization_service::UserAuthorizationService,
     AppState,
 };
@@ -74,214 +74,226 @@ impl FederatedUserService {
             }
         };
 
+        for server in servers {
+            results.push(
+                self.sync_user_to_server(&server, username, password, user_id)
+                    .await,
+            );
+        }
+
+        results
+    }
+
+    /// Syncs (creates if missing, or verifies) a user on a single server.
+    /// Used both by the all-servers admin-panel sync and by the
+    /// auto-create-on-login flow, which only ever needs to touch the one
+    /// server it just failed to authenticate a plain-credential probe on.
+    pub async fn sync_user_to_server(
+        &self,
+        server: &Server,
+        username: &str,
+        password: &Password,
+        user_id: &str,
+    ) -> ServerSyncResult {
         let config = self.config.read().await;
         let admin_password: HashedPassword = config.password.clone().into();
-
         drop(config);
 
-        for server in servers {
-            // Check if we have admin credentials for this server
-            if let Some(admin) = match self.server_storage.get_server_admin(server.id).await {
-                Ok(a) => a,
-                Err(e) => {
-                    results.push(ServerSyncResult {
-                        server_name: server.name.clone(),
-                        status: SyncStatus::Failed,
-                        message: Some(format!("Failed to get admin creds: {}", e)),
-                    });
-                    continue;
-                }
-            } {
-                // Decrypt admin password
-                let decrypted_admin_password =
-                    match decrypt_password(&admin.password, &admin_password) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            error!(
-                                "Failed to decrypt admin password for server {}: {}",
-                                server.name, e
-                            );
-                            results.push(ServerSyncResult {
-                                server_name: server.name.clone(),
-                                status: SyncStatus::Failed,
-                                message: Some("Failed to decrypt admin password".to_string()),
-                            });
-                            continue;
-                        }
-                    };
-
-                let client_info = crate::config::CLIENT_INFO.clone();
-
-                let client = match JellyfinClient::new(server.url.as_str(), client_info.clone()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("Failed to create jellyfin client: {}", e);
-                        results.push(ServerSyncResult {
-                            server_name: server.name.clone(),
-                            status: SyncStatus::Failed,
-                            message: Some(format!("Client error: {}", e)),
-                        });
-                        continue;
-                    }
-                };
-
-                // Authenticate as admin to get token
-                match client
-                    .authenticate_by_name(&admin.username, decrypted_admin_password.as_str())
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!(
-                            "Failed to authenticate as admin on server {}: {}",
-                            server.name, e
-                        );
-                        results.push(ServerSyncResult {
-                            server_name: server.name.clone(),
-                            status: SyncStatus::Failed,
-                            message: Some(format!("Admin auth failed: {}", e)),
-                        });
-                        continue;
-                    }
-                };
-
-                // Check if user exists
-                let users = match client.get_users().await {
-                    Ok(u) => u,
-                    Err(e) => {
-                        error!("Failed to list users on server {}: {}", server.name, e);
-                        results.push(ServerSyncResult {
-                            server_name: server.name.clone(),
-                            status: SyncStatus::Failed,
-                            message: Some(format!("Failed to list users: {}", e)),
-                        });
-                        continue;
-                    }
-                };
-
-                let existing_user = users.iter().find(|u| u.name.eq_ignore_ascii_case(username));
-
-                if let Some(remote_user) = existing_user {
-                    // User exists. Check if password matches.
-                    // We need a new client to check user password
-                    let user_client =
-                        match JellyfinClient::new(server.url.as_str(), client_info.clone()) {
-                            Ok(c) => c,
-                            Err(_) => continue,
-                        };
-
-                    let (status, should_map) = match user_client
-                        .authenticate_by_name(username, password.as_str())
-                        .await
-                    {
-                        Ok(_) => (SyncStatus::AlreadyExists, true),
-                        Err(_) => (SyncStatus::ExistsWithDifferentPassword, false),
-                    };
-
-                    info!(
-                        "Synced user {} to server {} (Remote ID: {}, Status: {:?})",
-                        username, server.name, remote_user.id, status
-                    );
-
-                    if should_map {
-                        if let Err(e) = self
-                            .user_authorization
-                            .add_server_mapping(
-                                user_id,
-                                &server,
-                                username,
-                                password,
-                                Some(&password.into()), // Encrypt with their own password so they can use it
-                            )
-                            .await
-                        {
-                            error!(
-                                "Failed to create local mapping for synced user on server {}: {}",
-                                server.name, e
-                            );
-                            results.push(ServerSyncResult {
-                                server_name: server.name.clone(),
-                                status: SyncStatus::Failed,
-                                message: Some(format!("Failed to save local mapping: {}", e)),
-                            });
-                        } else {
-                            results.push(ServerSyncResult {
-                                server_name: server.name.clone(),
-                                status,
-                                message: None,
-                            });
-                        }
-                    } else {
-                        results.push(ServerSyncResult {
-                            server_name: server.name.clone(),
-                            status,
-                            message: Some("User exists with different password".to_string()),
-                        });
-                    }
-                } else {
-                    // Create user
-                    match client.create_user(username, Some(password.as_str())).await {
-                        Ok(new_user) => {
-                            info!(
-                                "Synced user {} to server {} (Remote ID: {}, Status: Created)",
-                                username, server.name, new_user.id
-                            );
-
-                            if let Err(e) = self
-                                .user_authorization
-                                .add_server_mapping(
-                                    user_id,
-                                    &server,
-                                    username,
-                                    password,
-                                    Some(&password.into()), // Encrypt with their own password so they can use it
-                                )
-                                .await
-                            {
-                                error!(
-                                    "Failed to create local mapping for synced user on server {}: {}",
-                                    server.name, e
-                                );
-                                results.push(ServerSyncResult {
-                                    server_name: server.name.clone(),
-                                    status: SyncStatus::Failed,
-                                    message: Some(format!("Failed to save local mapping: {}", e)),
-                                });
-                            } else {
-                                results.push(ServerSyncResult {
-                                    server_name: server.name.clone(),
-                                    status: SyncStatus::Created,
-                                    message: None,
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to sync user {} to server {}: {}",
-                                username, server.name, e
-                            );
-                            results.push(ServerSyncResult {
-                                server_name: server.name.clone(),
-                                status: SyncStatus::Failed,
-                                message: Some(format!("Sync failed: {}", e)),
-                            });
-                        }
-                    }
-                }
-            } else {
+        let admin = match self.server_storage.get_server_admin(server.id).await {
+            Ok(Some(a)) => a,
+            Ok(None) => {
                 warn!(
                     "Skipping sync for server {}: No admin credentials configured",
                     server.name
                 );
-                results.push(ServerSyncResult {
+                return ServerSyncResult {
                     server_name: server.name.clone(),
                     status: SyncStatus::Skipped,
                     message: Some("No admin credentials".to_string()),
-                });
+                };
             }
+            Err(e) => {
+                return ServerSyncResult {
+                    server_name: server.name.clone(),
+                    status: SyncStatus::Failed,
+                    message: Some(format!("Failed to get admin creds: {}", e)),
+                };
+            }
+        };
+
+        let decrypted_admin_password = match decrypt_password(&admin.password, &admin_password) {
+            Ok(p) => p,
+            Err(e) => {
+                error!(
+                    "Failed to decrypt admin password for server {}: {}",
+                    server.name, e
+                );
+                return ServerSyncResult {
+                    server_name: server.name.clone(),
+                    status: SyncStatus::Failed,
+                    message: Some("Failed to decrypt admin password".to_string()),
+                };
+            }
+        };
+
+        let client_info = crate::config::CLIENT_INFO.clone();
+
+        let client = match JellyfinClient::new(server.url.as_str(), client_info.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to create jellyfin client: {}", e);
+                return ServerSyncResult {
+                    server_name: server.name.clone(),
+                    status: SyncStatus::Failed,
+                    message: Some(format!("Client error: {}", e)),
+                };
+            }
+        };
+
+        // Authenticate as admin to get token
+        if let Err(e) = client
+            .authenticate_by_name(&admin.username, decrypted_admin_password.as_str())
+            .await
+        {
+            error!(
+                "Failed to authenticate as admin on server {}: {}",
+                server.name, e
+            );
+            return ServerSyncResult {
+                server_name: server.name.clone(),
+                status: SyncStatus::Failed,
+                message: Some(format!("Admin auth failed: {}", e)),
+            };
         }
 
-        results
+        // Check if user exists
+        let users = match client.get_users().await {
+            Ok(u) => u,
+            Err(e) => {
+                error!("Failed to list users on server {}: {}", server.name, e);
+                return ServerSyncResult {
+                    server_name: server.name.clone(),
+                    status: SyncStatus::Failed,
+                    message: Some(format!("Failed to list users: {}", e)),
+                };
+            }
+        };
+
+        let existing_user = users.iter().find(|u| u.name.eq_ignore_ascii_case(username));
+
+        if let Some(remote_user) = existing_user {
+            // User exists. Check if password matches.
+            // We need a new client to check user password
+            let user_client = match JellyfinClient::new(server.url.as_str(), client_info.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to create jellyfin client: {}", e);
+                    return ServerSyncResult {
+                        server_name: server.name.clone(),
+                        status: SyncStatus::Failed,
+                        message: Some(format!("Client error: {}", e)),
+                    };
+                }
+            };
+
+            let (status, should_map) = match user_client
+                .authenticate_by_name(username, password.as_str())
+                .await
+            {
+                Ok(_) => (SyncStatus::AlreadyExists, true),
+                Err(_) => (SyncStatus::ExistsWithDifferentPassword, false),
+            };
+
+            info!(
+                "Synced user {} to server {} (Remote ID: {}, Status: {:?})",
+                username, server.name, remote_user.id, status
+            );
+
+            if !should_map {
+                return ServerSyncResult {
+                    server_name: server.name.clone(),
+                    status,
+                    message: Some("User exists with different password".to_string()),
+                };
+            }
+
+            if let Err(e) = self
+                .user_authorization
+                .add_server_mapping(
+                    user_id,
+                    server,
+                    username,
+                    password,
+                    Some(&password.into()), // Encrypt with their own password so they can use it
+                )
+                .await
+            {
+                error!(
+                    "Failed to create local mapping for synced user on server {}: {}",
+                    server.name, e
+                );
+                return ServerSyncResult {
+                    server_name: server.name.clone(),
+                    status: SyncStatus::Failed,
+                    message: Some(format!("Failed to save local mapping: {}", e)),
+                };
+            }
+
+            ServerSyncResult {
+                server_name: server.name.clone(),
+                status,
+                message: None,
+            }
+        } else {
+            // Create user
+            match client.create_user(username, Some(password.as_str())).await {
+                Ok(new_user) => {
+                    info!(
+                        "Synced user {} to server {} (Remote ID: {}, Status: Created)",
+                        username, server.name, new_user.id
+                    );
+
+                    if let Err(e) = self
+                        .user_authorization
+                        .add_server_mapping(
+                            user_id,
+                            server,
+                            username,
+                            password,
+                            Some(&password.into()), // Encrypt with their own password so they can use it
+                        )
+                        .await
+                    {
+                        error!(
+                            "Failed to create local mapping for synced user on server {}: {}",
+                            server.name, e
+                        );
+                        return ServerSyncResult {
+                            server_name: server.name.clone(),
+                            status: SyncStatus::Failed,
+                            message: Some(format!("Failed to save local mapping: {}", e)),
+                        };
+                    }
+
+                    ServerSyncResult {
+                        server_name: server.name.clone(),
+                        status: SyncStatus::Created,
+                        message: None,
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to sync user {} to server {}: {}",
+                        username, server.name, e
+                    );
+                    ServerSyncResult {
+                        server_name: server.name.clone(),
+                        status: SyncStatus::Failed,
+                        message: Some(format!("Sync failed: {}", e)),
+                    }
+                }
+            }
+        }
     }
 
     pub async fn delete_user_from_all_servers(&self, username: &str) -> Vec<ServerSyncResult> {
@@ -294,132 +306,139 @@ impl FederatedUserService {
             }
         };
 
-        let config = self.config.read().await;
-        let admin_password = &config.password;
-
         for server in servers {
-            if let Some(admin) = match self.server_storage.get_server_admin(server.id).await {
-                Ok(a) => a,
-                Err(e) => {
-                    results.push(ServerSyncResult {
-                        server_name: server.name.clone(),
-                        status: SyncStatus::Failed,
-                        message: Some(format!("Failed to get admin creds: {}", e)),
-                    });
-                    continue;
-                }
-            } {
-                let decrypted_admin_password =
-                    match decrypt_password(&admin.password, &admin_password.into()) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            error!(
-                                "Failed to decrypt admin password for server {}: {}",
-                                server.name, e
-                            );
-                            results.push(ServerSyncResult {
-                                server_name: server.name.clone(),
-                                status: SyncStatus::Failed,
-                                message: Some("Failed to decrypt admin password".to_string()),
-                            });
-                            continue;
-                        }
-                    };
-
-                let client_info = crate::config::CLIENT_INFO.clone();
-
-                let client = match JellyfinClient::new(server.url.as_str(), client_info.clone()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("Failed to create jellyfin client: {}", e);
-                        results.push(ServerSyncResult {
-                            server_name: server.name.clone(),
-                            status: SyncStatus::Failed,
-                            message: Some(format!("Client error: {}", e)),
-                        });
-                        continue;
-                    }
-                };
-
-                match client
-                    .authenticate_by_name(&admin.username, decrypted_admin_password.as_str())
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!(
-                            "Failed to authenticate as admin on server {}: {}",
-                            server.name, e
-                        );
-                        results.push(ServerSyncResult {
-                            server_name: server.name.clone(),
-                            status: SyncStatus::Failed,
-                            message: Some(format!("Admin auth failed: {}", e)),
-                        });
-                        continue;
-                    }
-                };
-
-                // Find user ID
-                let users = match client.get_users().await {
-                    Ok(u) => u,
-                    Err(e) => {
-                        error!("Failed to list users on server {}: {}", server.name, e);
-                        results.push(ServerSyncResult {
-                            server_name: server.name.clone(),
-                            status: SyncStatus::Failed,
-                            message: Some(format!("Failed to list users: {}", e)),
-                        });
-                        continue;
-                    }
-                };
-
-                let user_id = users
-                    .iter()
-                    .find(|u| u.name.eq_ignore_ascii_case(username))
-                    .map(|u| u.id.clone());
-
-                if let Some(id) = user_id {
-                    match client.delete_user(&id).await {
-                        Ok(_) => {
-                            info!(
-                                "Deleted user {} from server {} (Deleted: true)",
-                                username, server.name
-                            );
-                            results.push(ServerSyncResult {
-                                server_name: server.name.clone(),
-                                status: SyncStatus::Deleted,
-                                message: None,
-                            });
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to delete user {} from server {}: {}",
-                                username, server.name, e
-                            );
-                            results.push(ServerSyncResult {
-                                server_name: server.name.clone(),
-                                status: SyncStatus::Failed,
-                                message: Some(format!("Delete failed: {}", e)),
-                            });
-                        }
-                    }
-                } else {
-                    results.push(ServerSyncResult {
-                        server_name: server.name.clone(),
-                        status: SyncStatus::NotFound,
-                        message: None,
-                    });
-                }
-            } else {
-                results.push(ServerSyncResult {
-                    server_name: server.name.clone(),
-                    status: SyncStatus::Skipped,
-                    message: Some("No admin credentials".to_string()),
-                });
-            }
+            results.push(self.delete_user_from_server(&server, username).await);
         }
 
         results
+    }
+
+    /// Deletes the real upstream Jellyfin account for `username` on a
+    /// single server. Used both by the all-servers admin-panel delete and by
+    /// the per-server "kick" action, which must only ever touch the one
+    /// server the admin owns.
+    pub async fn delete_user_from_server(
+        &self,
+        server: &Server,
+        username: &str,
+    ) -> ServerSyncResult {
+        let admin_password = {
+            let config = self.config.read().await;
+            config.password.clone()
+        };
+
+        let admin = match self.server_storage.get_server_admin(server.id).await {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                return ServerSyncResult {
+                    server_name: server.name.clone(),
+                    status: SyncStatus::Skipped,
+                    message: Some("No admin credentials".to_string()),
+                };
+            }
+            Err(e) => {
+                return ServerSyncResult {
+                    server_name: server.name.clone(),
+                    status: SyncStatus::Failed,
+                    message: Some(format!("Failed to get admin creds: {}", e)),
+                };
+            }
+        };
+
+        let decrypted_admin_password =
+            match decrypt_password(&admin.password, &admin_password.into()) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(
+                        "Failed to decrypt admin password for server {}: {}",
+                        server.name, e
+                    );
+                    return ServerSyncResult {
+                        server_name: server.name.clone(),
+                        status: SyncStatus::Failed,
+                        message: Some("Failed to decrypt admin password".to_string()),
+                    };
+                }
+            };
+
+        let client_info = crate::config::CLIENT_INFO.clone();
+
+        let client = match JellyfinClient::new(server.url.as_str(), client_info.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to create jellyfin client: {}", e);
+                return ServerSyncResult {
+                    server_name: server.name.clone(),
+                    status: SyncStatus::Failed,
+                    message: Some(format!("Client error: {}", e)),
+                };
+            }
+        };
+
+        if let Err(e) = client
+            .authenticate_by_name(&admin.username, decrypted_admin_password.as_str())
+            .await
+        {
+            error!(
+                "Failed to authenticate as admin on server {}: {}",
+                server.name, e
+            );
+            return ServerSyncResult {
+                server_name: server.name.clone(),
+                status: SyncStatus::Failed,
+                message: Some(format!("Admin auth failed: {}", e)),
+            };
+        }
+
+        // Find user ID
+        let users = match client.get_users().await {
+            Ok(u) => u,
+            Err(e) => {
+                error!("Failed to list users on server {}: {}", server.name, e);
+                return ServerSyncResult {
+                    server_name: server.name.clone(),
+                    status: SyncStatus::Failed,
+                    message: Some(format!("Failed to list users: {}", e)),
+                };
+            }
+        };
+
+        let user_id = users
+            .iter()
+            .find(|u| u.name.eq_ignore_ascii_case(username))
+            .map(|u| u.id.clone());
+
+        let Some(id) = user_id else {
+            return ServerSyncResult {
+                server_name: server.name.clone(),
+                status: SyncStatus::NotFound,
+                message: None,
+            };
+        };
+
+        match client.delete_user(&id).await {
+            Ok(_) => {
+                info!(
+                    "Deleted user {} from server {} (Deleted: true)",
+                    username, server.name
+                );
+                ServerSyncResult {
+                    server_name: server.name.clone(),
+                    status: SyncStatus::Deleted,
+                    message: None,
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to delete user {} from server {}: {}",
+                    username, server.name, e
+                );
+                ServerSyncResult {
+                    server_name: server.name.clone(),
+                    status: SyncStatus::Failed,
+                    message: Some(format!("Delete failed: {}", e)),
+                }
+            }
+        }
     }
 }

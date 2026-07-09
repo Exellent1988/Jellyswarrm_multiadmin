@@ -128,6 +128,25 @@
                 </div>
             </td>
         </tr>
+        {% if !item.blocked_users.is_empty() %}
+        <tr>
+            <td colspan="{% if is_superadmin %}6{% else %}5{% endif %}" style="padding-top: 0;">
+                <small style="color: var(--pico-muted-color);">Blocked on {{ item.server.name }}:</small>
+                {% for block in item.blocked_users %}
+                <span class="badge" style="margin-left: 0.3rem;">
+                    {{ block.username }}
+                    <button type="button" class="icon-btn"
+                            hx-delete="/{{ ui_route }}/servers/{{ item.server.id }}/blocks/{{ block.username }}"
+                            hx-confirm="Unblock '{{ block.username }}' on '{{ item.server.name }}'? They will be able to log in / be auto-created there again."
+                            hx-target="#server-list" hx-swap="innerHTML"
+                            title="Unblock">
+                        <i class="fas fa-times" aria-hidden="true"></i>
+                    </button>
+                </span>
+                {% endfor %}
+            </td>
+        </tr>
+        {% endif %}
         {% endfor %}
     </tbody>
 </table>

@@ -14,6 +14,7 @@ use crate::{
     server_id::ServerId,
     server_storage::Server,
     ui::admin::ownership::{require_owner_or_superadmin, CurrentAdmin},
+    user_authorization_service::ServerUserBlock,
     AppState,
 };
 
@@ -31,6 +32,9 @@ pub struct ServerWithAdmin {
     /// Owning admin's username, resolved only when the viewer is a
     /// superadmin (the only audience the owner column is shown to).
     pub owner_username: Option<String>,
+    /// Usernames an admin has kicked-and-blocked from this server -- shown
+    /// so the owning admin (or a superadmin) can lift the block again.
+    pub blocked_users: Vec<ServerUserBlock>,
 }
 
 #[derive(Template)]
@@ -107,12 +111,18 @@ async fn render_server_list(state: &AppState, viewer: &CurrentAdmin) -> Result<S
                 } else {
                     None
                 };
+                let blocked_users = state
+                    .user_authorization
+                    .list_blocks_for_server(server.id)
+                    .await
+                    .unwrap_or_default();
                 servers_with_admin.push(ServerWithAdmin {
                     server,
                     has_admin,
                     is_redirect,
                     is_proxy: !is_redirect,
                     owner_username,
+                    blocked_users,
                 });
             }
 
@@ -531,6 +541,37 @@ pub async fn delete_server_admin(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html("<div class=\"alert alert-error\">Failed to delete admin</div>"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Lift a kick-and-block, allowing the username to be mapped/auto-created on
+/// this server again.
+pub async fn unblock_server_user(
+    State(state): State<AppState>,
+    admin: CurrentAdmin,
+    Path((server_id, username)): Path<(ServerId, String)>,
+) -> Response {
+    if let Err(rejection) = require_owner_or_superadmin(&state, &admin, server_id).await {
+        return rejection;
+    }
+
+    match state
+        .user_authorization
+        .unblock_user_on_server(server_id, &username)
+        .await
+    {
+        Ok(_) => {
+            info!("Unblocked user '{}' on server {}", username, server_id);
+            server_list_response(&state, &admin).await
+        }
+        Err(e) => {
+            error!("Failed to unblock user '{}': {}", username, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html("<div class=\"alert alert-error\">Failed to unblock user</div>"),
             )
                 .into_response()
         }

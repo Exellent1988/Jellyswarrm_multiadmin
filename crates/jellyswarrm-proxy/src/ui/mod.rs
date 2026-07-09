@@ -135,6 +135,10 @@ pub fn ui_routes() -> axum::Router<AppState> {
             "/users/{user_id}/sessions",
             axum::routing::delete(admin::users::delete_sessions),
         )
+        .route(
+            "/users/{user_id}/mappings/{mapping_id}/kick",
+            post(admin::users::kick_user),
+        )
         .route("/servers", get(admin::servers::servers_page))
         .route("/servers", post(admin::servers::add_server))
         .route("/servers/list", get(admin::servers::get_server_list))
@@ -157,6 +161,10 @@ pub fn ui_routes() -> axum::Router<AppState> {
         .route(
             "/servers/{id}/admin",
             axum::routing::delete(admin::servers::delete_server_admin),
+        )
+        .route(
+            "/servers/{id}/blocks/{username}",
+            axum::routing::delete(admin::servers::unblock_server_user),
         )
         .merge(superadmin_routes())
         .route_layer(middleware::from_fn(require_admin));
