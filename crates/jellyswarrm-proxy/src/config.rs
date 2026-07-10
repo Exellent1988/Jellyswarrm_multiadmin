@@ -141,6 +141,22 @@ fn default_merge_libraries() -> bool {
     true
 }
 
+fn default_login_rate_limit_enabled() -> bool {
+    true
+}
+
+fn default_login_rate_limit_max_attempts() -> i64 {
+    5
+}
+
+fn default_login_rate_limit_window_secs() -> i64 {
+    300
+}
+
+fn default_login_rate_limit_cooldown_secs() -> i64 {
+    900
+}
+
 mod base64_serde {
     use super::*;
     use serde::de::Error as DeError;
@@ -234,6 +250,26 @@ define_fallback_deserializer!(
     default_auto_create_users_on_login
 );
 define_fallback_deserializer!(deserialize_merge_libraries, bool, default_merge_libraries);
+define_fallback_deserializer!(
+    deserialize_login_rate_limit_enabled,
+    bool,
+    default_login_rate_limit_enabled
+);
+define_fallback_deserializer!(
+    deserialize_login_rate_limit_max_attempts,
+    i64,
+    default_login_rate_limit_max_attempts
+);
+define_fallback_deserializer!(
+    deserialize_login_rate_limit_window_secs,
+    i64,
+    default_login_rate_limit_window_secs
+);
+define_fallback_deserializer!(
+    deserialize_login_rate_limit_cooldown_secs,
+    i64,
+    default_login_rate_limit_cooldown_secs
+);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PreconfiguredServer {
@@ -308,6 +344,30 @@ pub struct AppConfig {
         deserialize_with = "deserialize_merge_libraries"
     )]
     pub merge_libraries: bool,
+
+    #[serde(
+        default = "default_login_rate_limit_enabled",
+        deserialize_with = "deserialize_login_rate_limit_enabled"
+    )]
+    pub login_rate_limit_enabled: bool,
+
+    #[serde(
+        default = "default_login_rate_limit_max_attempts",
+        deserialize_with = "deserialize_login_rate_limit_max_attempts"
+    )]
+    pub login_rate_limit_max_attempts: i64,
+
+    #[serde(
+        default = "default_login_rate_limit_window_secs",
+        deserialize_with = "deserialize_login_rate_limit_window_secs"
+    )]
+    pub login_rate_limit_window_secs: i64,
+
+    #[serde(
+        default = "default_login_rate_limit_cooldown_secs",
+        deserialize_with = "deserialize_login_rate_limit_cooldown_secs"
+    )]
+    pub login_rate_limit_cooldown_secs: i64,
 }
 
 impl fmt::Debug for AppConfig {
@@ -338,6 +398,11 @@ impl fmt::Debug for AppConfig {
             .field(
                 "auto_create_users_on_login",
                 &self.auto_create_users_on_login,
+            )
+            .field("login_rate_limit_enabled", &self.login_rate_limit_enabled)
+            .field(
+                "login_rate_limit_max_attempts",
+                &self.login_rate_limit_max_attempts,
             )
             .finish()
     }

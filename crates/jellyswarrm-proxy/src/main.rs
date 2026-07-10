@@ -27,6 +27,7 @@ use axum_login::{
 };
 
 mod admin_id;
+mod client_ip;
 mod config;
 mod console_admin_service;
 mod encryption;
@@ -34,6 +35,7 @@ mod extractors;
 mod federated_users;
 mod handlers;
 mod legacy_server_identity;
+mod login_rate_limit_service;
 mod media_storage_service;
 mod merged_library_service;
 mod models;
@@ -52,6 +54,7 @@ use console_admin_service::ConsoleAdminService;
 use federated_users::FederatedUserService;
 use handlers::syncplay::SyncPlayService;
 use legacy_server_identity::canonicalize_legacy_server_identity;
+use login_rate_limit_service::LoginRateLimitService;
 use media_storage_service::MediaStorageService;
 use merged_library_service::MergedLibraryService;
 use server_storage::{Server, ServerStorageService};
@@ -97,6 +100,7 @@ pub struct AppState {
     pub federated_users: Arc<FederatedUserService>,
     pub syncplay: Arc<SyncPlayService>,
     pub console_admins: Arc<ConsoleAdminService>,
+    pub login_rate_limit: Arc<LoginRateLimitService>,
 }
 
 impl AppState {
@@ -116,6 +120,9 @@ impl AppState {
             data_context.user_authorization.clone(),
             data_context.config.clone(),
         ));
+        let login_rate_limit = Arc::new(LoginRateLimitService::new(
+            data_context.user_authorization.pool(),
+        ));
 
         Self {
             reqwest_client,
@@ -129,6 +136,7 @@ impl AppState {
             processors: Arc::new(proxy_processors),
             quick_connect,
             federated_users,
+            login_rate_limit,
             console_admins,
             syncplay: Arc::new(SyncPlayService::new()),
         }

@@ -94,6 +94,24 @@ pub async fn handle_authenticate_by_name(
     headers: HeaderMap,
     Json(payload): Json<AuthenticateRequest>,
 ) -> Result<Json<AuthenticateResponse>, StatusCode> {
+    let client_ip = crate::client_ip::extract_client_ip(&headers);
+    let rate_limit_enabled = { state.config.read().await.login_rate_limit_enabled };
+
+    if rate_limit_enabled {
+        if let Some(seconds_remaining) = state
+            .login_rate_limit
+            .seconds_until_unblocked(&client_ip)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        {
+            warn!(
+                "Rejecting login for '{}' from {}: rate-limited for {}s more",
+                payload.username, client_ip, seconds_remaining
+            );
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
     let mut servers = state
         .server_storage
         .list_servers()
@@ -317,8 +335,36 @@ pub async fn handle_authenticate_by_name(
             "All authentication attempts failed for user: {}",
             payload.username
         );
+        if rate_limit_enabled {
+            let (max_attempts, window_secs, cooldown_secs) = {
+                let config = state.config.read().await;
+                (
+                    config.login_rate_limit_max_attempts,
+                    config.login_rate_limit_window_secs,
+                    config.login_rate_limit_cooldown_secs,
+                )
+            };
+            match state
+                .login_rate_limit
+                .record_failure(&client_ip, max_attempts, window_secs, cooldown_secs)
+                .await
+            {
+                Ok(true) => warn!(
+                    "Client {} exceeded {} failed login attempts; blocking for {}s",
+                    client_ip, max_attempts, cooldown_secs
+                ),
+                Ok(false) => {}
+                Err(e) => error!("Failed to record login failure for {}: {}", client_ip, e),
+            }
+        }
         Err(StatusCode::UNAUTHORIZED)
     } else {
+        if rate_limit_enabled {
+            if let Err(e) = state.login_rate_limit.record_success(&client_ip).await {
+                error!("Failed to clear login rate limit for {}: {}", client_ip, e);
+            }
+        }
+
         let user =
             resolve_or_create_login_user(&state, &payload.username, &payload.password).await?;
 
@@ -1271,5 +1317,207 @@ mod tests {
             mappings[0].server_id, server_b_id,
             "the surviving mapping must be server A, not the blocked server B"
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_logins_from_same_ip_get_rate_limited() {
+        let state = create_test_app_state().await;
+
+        let mock = MockServer::start().await;
+        state
+            .server_storage
+            .add_server("Server A", &mock.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+
+        // AppConfig::default() sets max_attempts=5; this mock must be hit
+        // exactly that many times -- if the 6th (blocked) attempt still
+        // reached the network, `mock.verify()` below would fail.
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(5)
+            .mount(&mock)
+            .await;
+
+        let mut headers = login_headers();
+        headers.insert(
+            "x-forwarded-for",
+            hyper::http::HeaderValue::from_static("9.9.9.9"),
+        );
+
+        for _ in 0..5 {
+            let result = handle_authenticate_by_name(
+                State(state.clone()),
+                headers.clone(),
+                Json(AuthenticateRequest {
+                    username: "attacker".to_string(),
+                    password: "wrong".into(),
+                }),
+            )
+            .await;
+            assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+        }
+
+        let result = handle_authenticate_by_name(
+            State(state.clone()),
+            headers.clone(),
+            Json(AuthenticateRequest {
+                username: "attacker".to_string(),
+                password: "wrong-again".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "6th attempt should be rate-limited"
+        );
+
+        mock.verify().await;
+    }
+
+    #[tokio::test]
+    async fn different_client_ips_are_not_rate_limited_together() {
+        let state = create_test_app_state().await;
+
+        let mock = MockServer::start().await;
+        state
+            .server_storage
+            .add_server("Server A", &mock.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock)
+            .await;
+
+        let mut headers_a = login_headers();
+        headers_a.insert(
+            "x-forwarded-for",
+            hyper::http::HeaderValue::from_static("1.1.1.1"),
+        );
+        let mut headers_b = login_headers();
+        headers_b.insert(
+            "x-forwarded-for",
+            hyper::http::HeaderValue::from_static("2.2.2.2"),
+        );
+
+        for _ in 0..5 {
+            handle_authenticate_by_name(
+                State(state.clone()),
+                headers_a.clone(),
+                Json(AuthenticateRequest {
+                    username: "attacker".to_string(),
+                    password: "wrong".into(),
+                }),
+            )
+            .await
+            .unwrap_err();
+        }
+
+        // IP A is now blocked; IP B, having made no attempts, must still get
+        // a normal (non-rate-limited) auth failure.
+        let result_b = handle_authenticate_by_name(
+            State(state.clone()),
+            headers_b.clone(),
+            Json(AuthenticateRequest {
+                username: "attacker".to_string(),
+                password: "wrong".into(),
+            }),
+        )
+        .await;
+        assert_eq!(result_b.unwrap_err(), StatusCode::UNAUTHORIZED);
+
+        let result_a = handle_authenticate_by_name(
+            State(state.clone()),
+            headers_a.clone(),
+            Json(AuthenticateRequest {
+                username: "attacker".to_string(),
+                password: "wrong".into(),
+            }),
+        )
+        .await;
+        assert_eq!(result_a.unwrap_err(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn successful_login_resets_the_rate_limit_counter() {
+        use wiremock::matchers::body_partial_json;
+
+        let state = create_test_app_state().await;
+        let mock = MockServer::start().await;
+        state
+            .server_storage
+            .add_server("Server A", &mock.uri(), 100, MediaStreamingMode::Redirect)
+            .await
+            .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .and(body_partial_json(serde_json::json!({"Pw": "wrong"})))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/Users/AuthenticateByName"))
+            .and(body_partial_json(serde_json::json!({"Pw": "correct"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_authenticate_response("resetuser")),
+            )
+            .mount(&mock)
+            .await;
+
+        let mut headers = login_headers();
+        headers.insert(
+            "x-forwarded-for",
+            hyper::http::HeaderValue::from_static("8.8.8.8"),
+        );
+
+        for _ in 0..4 {
+            let result = handle_authenticate_by_name(
+                State(state.clone()),
+                headers.clone(),
+                Json(AuthenticateRequest {
+                    username: "resetuser".to_string(),
+                    password: "wrong".into(),
+                }),
+            )
+            .await;
+            assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+        }
+
+        let _ = handle_authenticate_by_name(
+            State(state.clone()),
+            headers.clone(),
+            Json(AuthenticateRequest {
+                username: "resetuser".to_string(),
+                password: "correct".into(),
+            }),
+        )
+        .await
+        .expect("login should succeed");
+
+        // If the successful login hadn't reset the counter, these 4 more
+        // failures (8 total) would have tripped the 5-attempt limit well
+        // before this loop finishes.
+        for _ in 0..4 {
+            let result = handle_authenticate_by_name(
+                State(state.clone()),
+                headers.clone(),
+                Json(AuthenticateRequest {
+                    username: "resetuser".to_string(),
+                    password: "wrong".into(),
+                }),
+            )
+            .await;
+            assert_eq!(
+                result.unwrap_err(),
+                StatusCode::UNAUTHORIZED,
+                "should still be a plain auth failure, not rate-limited, since the counter reset after the success"
+            );
+        }
     }
 }

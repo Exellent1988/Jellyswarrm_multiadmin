@@ -1,0 +1,66 @@
+<div id="login-security-messages"></div>
+
+<section id="login-security-config" aria-labelledby="login-security-config-heading">
+    <h2 id="login-security-config-heading" class="section-heading-tight">Rate Limit Settings</h2>
+    <form hx-post="/{{ ui_route }}/login-security/config" hx-target="#login-security-panel" hx-swap="innerHTML" hx-disabled-elt="this">
+        <fieldset>
+            <label>Enabled
+                <input type="checkbox" role="switch" name="enabled" value="true" {% if enabled %}checked{% endif %}>
+            </label>
+            <label>Max Failed Attempts
+                <input type="number" name="max_attempts" value="{{ max_attempts }}" min="1" max="1000" required>
+            </label>
+            <label>Window (seconds)
+                <span class="info-hint" tabindex="0" title="Failed attempts older than this are forgotten and don't count toward the limit." aria-label="Window help">
+                    <i class="fas fa-circle-info" aria-hidden="true"></i>
+                </span>
+                <input type="number" name="window_secs" value="{{ window_secs }}" min="1" required>
+            </label>
+            <label>Cooldown (seconds)
+                <span class="info-hint" tabindex="0" title="How long a source is blocked once it exceeds the max attempts." aria-label="Cooldown help">
+                    <i class="fas fa-circle-info" aria-hidden="true"></i>
+                </span>
+                <input type="number" name="cooldown_secs" value="{{ cooldown_secs }}" min="1" required>
+            </label>
+        </fieldset>
+        <button type="submit">Save</button>
+    </form>
+</section>
+
+<hr />
+
+<section id="login-security-blocklist" aria-labelledby="login-security-blocklist-heading">
+    <h2 id="login-security-blocklist-heading" class="section-heading-tight">Currently Blocked</h2>
+    {% if blocked.is_empty() %}
+    <p>Nothing is currently blocked.</p>
+    {% else %}
+    <table aria-label="Blocked login sources">
+        <thead>
+            <tr>
+                <th>Source</th>
+                <th>Failed Attempts</th>
+                <th>Unblocks In</th>
+                <th style="text-align: center;">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for entry in blocked %}
+            <tr>
+                <td>{{ entry.identifier }}</td>
+                <td>{{ entry.failure_count }}</td>
+                <td>{{ entry.seconds_remaining }}s</td>
+                <td style="text-align: center;">
+                    <button type="button" class="icon-btn danger"
+                            hx-delete="/{{ ui_route }}/login-security/blocks/{{ entry.identifier }}"
+                            hx-confirm="Unblock '{{ entry.identifier }}'?"
+                            hx-target="#login-security-panel" hx-swap="innerHTML"
+                            title="Unblock">
+                        <i class="fas fa-lock-open" aria-hidden="true"></i>
+                    </button>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</section>

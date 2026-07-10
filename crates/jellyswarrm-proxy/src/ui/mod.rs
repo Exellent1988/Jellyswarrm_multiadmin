@@ -166,6 +166,22 @@ pub fn ui_routes() -> axum::Router<AppState> {
             "/servers/{id}/blocks/{username}",
             axum::routing::delete(admin::servers::unblock_server_user),
         )
+        .route(
+            "/login-security",
+            get(admin::login_security::login_security_page),
+        )
+        .route(
+            "/login-security/panel",
+            get(admin::login_security::get_login_security_panel),
+        )
+        .route(
+            "/login-security/config",
+            post(admin::login_security::save_login_security),
+        )
+        .route(
+            "/login-security/blocks/{identifier}",
+            axum::routing::delete(admin::login_security::unblock_login_rate_limit),
+        )
         .merge(superadmin_routes())
         .route_layer(middleware::from_fn(require_admin));
 

@@ -312,6 +312,13 @@ impl UserAuthorizationService {
         Self { pool }
     }
 
+    /// Exposes the underlying pool so other services can be constructed
+    /// against the same database without every `AppState::new` call site
+    /// needing to be threaded a fresh parameter for each new service.
+    pub fn pool(&self) -> SqlitePool {
+        self.pool.clone()
+    }
+
     fn normalized_username_key(username: &str) -> String {
         username.trim().to_string()
     }

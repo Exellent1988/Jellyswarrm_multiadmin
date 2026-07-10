@@ -21,6 +21,12 @@
         Settings
     </a>
 </li>
+<li>
+    <a href="#" hx-get="/{{ ui_route }}/login-security" hx-target="#main-content" class="nav-link">
+        <i class="fas fa-shield-halved" style="margin-right: 0.25rem;"></i>
+        Login Security
+    </a>
+</li>
 {% if is_superadmin %}
 <li>
     <a href="#" hx-get="/{{ ui_route }}/admins" hx-target="#main-content" class="nav-link">

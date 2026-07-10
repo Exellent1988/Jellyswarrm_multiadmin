@@ -1,0 +1,10 @@
+<div id="messages"></div>
+
+<header>
+    <h1>Login Security</h1>
+    <h3>Blocks repeated failed logins from the same source after too many attempts. Instance-wide -- visible and manageable by every admin.</h3>
+</header>
+
+<section id="login-security-panel" hx-get="/{{ ui_route }}/login-security/panel" hx-trigger="load">
+    <p>Loading...</p>
+</section>
