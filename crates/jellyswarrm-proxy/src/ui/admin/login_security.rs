@@ -19,6 +19,8 @@ pub struct LoginSecurityPageTemplate {
 pub struct BlockedEntryView {
     pub identifier: String,
     pub failure_count: i64,
+    pub times_blocked: i64,
+    pub permanent: bool,
     pub seconds_remaining: i64,
 }
 
@@ -29,6 +31,7 @@ pub struct LoginSecurityPanelTemplate {
     pub max_attempts: i64,
     pub window_secs: i64,
     pub cooldown_secs: i64,
+    pub permanent_after_repeats: i64,
     pub blocked: Vec<BlockedEntryView>,
     pub ui_route: String,
 }
@@ -72,6 +75,8 @@ async fn render_panel(state: &AppState) -> Result<String, String> {
             BlockedEntryView {
                 identifier: entry.identifier,
                 failure_count: entry.failure_count,
+                times_blocked: entry.times_blocked,
+                permanent: entry.permanent,
                 seconds_remaining,
             }
         })
@@ -82,6 +87,7 @@ async fn render_panel(state: &AppState) -> Result<String, String> {
         max_attempts: cfg.login_rate_limit_max_attempts,
         window_secs: cfg.login_rate_limit_window_secs,
         cooldown_secs: cfg.login_rate_limit_cooldown_secs,
+        permanent_after_repeats: cfg.login_rate_limit_permanent_after_repeats,
         blocked,
         ui_route: state.get_ui_route().await,
     };
@@ -112,6 +118,9 @@ pub struct SaveLoginSecurityForm {
     pub max_attempts: i64,
     pub window_secs: i64,
     pub cooldown_secs: i64,
+    /// 0 disables escalation to a permanent block entirely.
+    #[serde(default)]
+    pub permanent_after_repeats: i64,
 }
 
 pub async fn save_login_security(
@@ -119,10 +128,14 @@ pub async fn save_login_security(
     _admin: CurrentAdmin,
     Form(form): Form<SaveLoginSecurityForm>,
 ) -> Response {
-    if form.max_attempts < 1 || form.window_secs < 1 || form.cooldown_secs < 1 {
+    if form.max_attempts < 1
+        || form.window_secs < 1
+        || form.cooldown_secs < 1
+        || form.permanent_after_repeats < 0
+    {
         return (
             StatusCode::BAD_REQUEST,
-            Html("<div class=\"alert alert-error\">Values must be positive</div>"),
+            Html("<div class=\"alert alert-error\">Values must be positive (permanent-after may be 0 to disable)</div>"),
         )
             .into_response();
     }
@@ -133,6 +146,7 @@ pub async fn save_login_security(
         cfg.login_rate_limit_max_attempts = form.max_attempts;
         cfg.login_rate_limit_window_secs = form.window_secs;
         cfg.login_rate_limit_cooldown_secs = form.cooldown_secs;
+        cfg.login_rate_limit_permanent_after_repeats = form.permanent_after_repeats;
         if let Err(e) = save_config(&cfg) {
             error!("Save failed: {}", e);
         }

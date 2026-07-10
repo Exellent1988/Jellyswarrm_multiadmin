@@ -157,6 +157,10 @@ fn default_login_rate_limit_cooldown_secs() -> i64 {
     900
 }
 
+fn default_login_rate_limit_permanent_after_repeats() -> i64 {
+    3
+}
+
 mod base64_serde {
     use super::*;
     use serde::de::Error as DeError;
@@ -270,6 +274,11 @@ define_fallback_deserializer!(
     i64,
     default_login_rate_limit_cooldown_secs
 );
+define_fallback_deserializer!(
+    deserialize_login_rate_limit_permanent_after_repeats,
+    i64,
+    default_login_rate_limit_permanent_after_repeats
+);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PreconfiguredServer {
@@ -368,6 +377,15 @@ pub struct AppConfig {
         deserialize_with = "deserialize_login_rate_limit_cooldown_secs"
     )]
     pub login_rate_limit_cooldown_secs: i64,
+
+    /// After this many full cooldown cycles, an identifier is blocked
+    /// permanently instead of just cooling down again (0 disables
+    /// escalation entirely).
+    #[serde(
+        default = "default_login_rate_limit_permanent_after_repeats",
+        deserialize_with = "deserialize_login_rate_limit_permanent_after_repeats"
+    )]
+    pub login_rate_limit_permanent_after_repeats: i64,
 }
 
 impl fmt::Debug for AppConfig {

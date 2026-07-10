@@ -98,16 +98,24 @@ pub async fn handle_authenticate_by_name(
     let rate_limit_enabled = { state.config.read().await.login_rate_limit_enabled };
 
     if rate_limit_enabled {
-        if let Some(seconds_remaining) = state
+        if let Some(status) = state
             .login_rate_limit
-            .seconds_until_unblocked(&client_ip)
+            .check_blocked(&client_ip)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         {
-            warn!(
-                "Rejecting login for '{}' from {}: rate-limited for {}s more",
-                payload.username, client_ip, seconds_remaining
-            );
+            match status {
+                crate::login_rate_limit_service::LoginBlockStatus::Cooldown {
+                    seconds_remaining,
+                } => warn!(
+                    "Rejecting login for '{}' from {}: rate-limited for {}s more",
+                    payload.username, client_ip, seconds_remaining
+                ),
+                crate::login_rate_limit_service::LoginBlockStatus::Permanent => warn!(
+                    "Rejecting login for '{}' from {}: permanently blocked (repeat offender)",
+                    payload.username, client_ip
+                ),
+            }
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
     }
@@ -336,24 +344,37 @@ pub async fn handle_authenticate_by_name(
             payload.username
         );
         if rate_limit_enabled {
-            let (max_attempts, window_secs, cooldown_secs) = {
+            let (max_attempts, window_secs, cooldown_secs, permanent_after_repeats) = {
                 let config = state.config.read().await;
                 (
                     config.login_rate_limit_max_attempts,
                     config.login_rate_limit_window_secs,
                     config.login_rate_limit_cooldown_secs,
+                    config.login_rate_limit_permanent_after_repeats,
                 )
             };
             match state
                 .login_rate_limit
-                .record_failure(&client_ip, max_attempts, window_secs, cooldown_secs)
+                .record_failure(
+                    &client_ip,
+                    max_attempts,
+                    window_secs,
+                    cooldown_secs,
+                    permanent_after_repeats,
+                )
                 .await
             {
-                Ok(true) => warn!(
+                Ok(Some(crate::login_rate_limit_service::LoginBlockStatus::Cooldown {
+                    ..
+                })) => warn!(
                     "Client {} exceeded {} failed login attempts; blocking for {}s",
                     client_ip, max_attempts, cooldown_secs
                 ),
-                Ok(false) => {}
+                Ok(Some(crate::login_rate_limit_service::LoginBlockStatus::Permanent)) => warn!(
+                    "Client {} is now permanently blocked after repeated offenses",
+                    client_ip
+                ),
+                Ok(None) => {}
                 Err(e) => error!("Failed to record login failure for {}: {}", client_ip, e),
             }
         }

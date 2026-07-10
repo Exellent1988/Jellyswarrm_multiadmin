@@ -22,6 +22,12 @@
                 </span>
                 <input type="number" name="cooldown_secs" value="{{ cooldown_secs }}" min="1" required>
             </label>
+            <label>Permanent Block After (cooldown cycles)
+                <span class="info-hint" tabindex="0" title="After this many full cooldown cycles, a source is blocked permanently until an admin manually unblocks it. Set to 0 to disable and only ever use plain cooldowns." aria-label="Permanent block help">
+                    <i class="fas fa-circle-info" aria-hidden="true"></i>
+                </span>
+                <input type="number" name="permanent_after_repeats" value="{{ permanent_after_repeats }}" min="0" required>
+            </label>
         </fieldset>
         <button type="submit">Save</button>
     </form>
@@ -39,7 +45,8 @@
             <tr>
                 <th>Source</th>
                 <th>Failed Attempts</th>
-                <th>Unblocks In</th>
+                <th>Times Blocked</th>
+                <th>Status</th>
                 <th style="text-align: center;">Actions</th>
             </tr>
         </thead>
@@ -48,11 +55,18 @@
             <tr>
                 <td>{{ entry.identifier }}</td>
                 <td>{{ entry.failure_count }}</td>
-                <td>{{ entry.seconds_remaining }}s</td>
+                <td>{{ entry.times_blocked }}</td>
+                <td>
+                    {% if entry.permanent %}
+                    <span class="badge" style="background-color: var(--pico-del-color); color: white;">PERMANENT</span>
+                    {% else %}
+                    {{ entry.seconds_remaining }}s remaining
+                    {% endif %}
+                </td>
                 <td style="text-align: center;">
                     <button type="button" class="icon-btn danger"
                             hx-delete="/{{ ui_route }}/login-security/blocks/{{ entry.identifier }}"
-                            hx-confirm="Unblock '{{ entry.identifier }}'?"
+                            hx-confirm="Unblock '{{ entry.identifier }}'? This also resets its repeat-offender count."
                             hx-target="#login-security-panel" hx-swap="innerHTML"
                             title="Unblock">
                         <i class="fas fa-lock-open" aria-hidden="true"></i>
